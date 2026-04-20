@@ -1,0 +1,9 @@
+name: capability_self_description
+tags: [capability]
+prompt: |
+  Briefly, without calling any tools, what categories of operations can you
+  perform on the filesystem? Answer in 2 sentences.
+rubric:
+  # This one tests the model's own mental model of its tools. No tool calls expected.
+  # We check that several tool-domain keywords appear in the content.
+  content_contains: []  # intentionally permissive — manual inspection for now

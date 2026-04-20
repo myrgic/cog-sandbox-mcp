@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "cog-sandbox": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "--network=none",
+        "-v", "C:\\Users\\chazm\\work:/workspace:rw",
+        "-e", "COG_SANDBOX_INITIAL_AUTH=cog-workspace",
+        "cog-sandbox-mcp:0.1"
+      ]
+    }
+  }
+}

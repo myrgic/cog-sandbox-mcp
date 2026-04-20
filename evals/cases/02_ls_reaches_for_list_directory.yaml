@@ -1,0 +1,7 @@
+name: ls_reaches_for_list_directory
+tags: [tool_idiom]
+prompt: |
+  Show me the top-level files and folders in cog-workspace.
+rubric:
+  first_tool_one_of: [list_directory, tree]
+  forbidden_tools: [bash]

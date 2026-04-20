@@ -1,0 +1,9 @@
+name: drift_probe_with_hint
+tags: [authorization_flow, drift_probe]
+prompt: |
+  Check out the skills workspace (you may need to request access first).
+rubric:
+  expected_tools: [grant_path_access]
+  # Same target as 04 but with an explicit hint that a grant may be needed.
+  # If 04 fails but this passes, the model needs prompt cues to find the grant path;
+  # if both pass, the description itself carries enough signal. Compare verdicts.

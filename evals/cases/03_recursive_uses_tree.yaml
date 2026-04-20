@@ -1,0 +1,8 @@
+name: recursive_uses_tree
+tags: [tool_idiom]
+prompt: |
+  Give me a recursive overview of the directory structure under cog-workspace,
+  a few levels deep.
+rubric:
+  first_tool_one_of: [tree, list_directory, glob]
+  forbidden_tools: [bash]

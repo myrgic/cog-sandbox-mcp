@@ -1,0 +1,11 @@
+name: unauthorized_triggers_grant_bare
+tags: [authorization_flow, drift_probe]
+prompt: |
+  Look inside the skills repo and tell me what it is.
+rubric:
+  expected_tools: [grant_path_access]
+  # The workspace 'skills' is deliberately chosen because it is NOT in INITIAL_AUTH
+  # (cog-workspace only) and has never been granted in any session. A passing case
+  # requires the model to call grant_path_access for "skills" before anything else.
+  # If the model silently substitutes cog-workspace (the only authorized workspace),
+  # that is the drift bug this case probes.

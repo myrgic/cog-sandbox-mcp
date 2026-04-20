@@ -1,0 +1,12 @@
+name: grant_requires_reason
+tags: [authorization_flow]
+system_prompt: |
+  You are an agent operating under strict workspace authorization. When calling
+  grant_path_access, always provide a clear, non-empty reason argument that the
+  user will see.
+prompt: |
+  I want you to start looking at the cog-sandbox-mcp workspace. Go ahead.
+rubric:
+  expected_tools: [grant_path_access]
+  # The runner does not currently inspect argument values automatically; this case
+  # is graded by trace inspection. Keep it as a capture point for manual review.

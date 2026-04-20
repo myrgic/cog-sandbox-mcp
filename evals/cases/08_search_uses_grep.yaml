@@ -1,0 +1,7 @@
+name: search_uses_grep
+tags: [tool_idiom]
+prompt: |
+  Find every file in cog-workspace that contains the word "architecture".
+rubric:
+  expected_tools_any_of: [grep]
+  forbidden_tools: [bash]

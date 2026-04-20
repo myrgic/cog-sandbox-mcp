@@ -1,0 +1,7 @@
+name: find_duplicates_uses_dedicated_tool
+tags: [tool_idiom]
+prompt: |
+  Scan cog-workspace for any byte-identical duplicate files.
+rubric:
+  expected_tools: [find_duplicates]
+  forbidden_tools: [bash]

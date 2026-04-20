@@ -1,0 +1,10 @@
+name: authorized_no_spurious_grant
+tags: [authorization_flow]
+prompt: |
+  Tell me what the top-level folders are in cog-workspace.
+rubric:
+  forbidden_tools: [grant_path_access]
+  expected_tools_any_of: [list_directory, tree]
+  # Control case — cog-workspace is in INITIAL_AUTH, so the model should NOT call
+  # grant_path_access. Catches overcorrection from the description tightening
+  # (model asking for access it already has).
