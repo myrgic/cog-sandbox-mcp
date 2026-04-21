@@ -17,6 +17,8 @@ See `project_cog_os_layering.md` in memory for the architectural frame.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import urllib.error
@@ -264,6 +266,99 @@ def cogos_events_read(
         }
 
 
+def cogos_resolve(uri: str, decode: bool = True) -> dict[str, Any]:
+    """Resolve a cog:// URI against the Cog OS kernel and return its contents.
+
+    GETs {COG_OS_BASE_URL}/resolve?uri=<url-encoded cog-uri>. The kernel
+    returns JSON of the form {"uri", "content": <base64>, ...} on success.
+    On a bogus / missing URI the kernel returns HTTP 500 with
+    {"error": {"message", "type"}} — in that case this tool returns
+    {"success": False, "error": ..., "uri": ...} rather than raising.
+
+    CALL THIS WHEN you need to read a specific resource addressed by its
+    cog:// URI — e.g. an ADR (cog://adr/085), a memory entry, a source
+    artifact. If you do not know the exact URI, prefer an upstream listing
+    or query tool; do not guess URIs blindly.
+
+    Decoding contract (the kernel always wire-encodes content as base64):
+    - decode=True (default): try base64-decode then UTF-8-decode. On success,
+      `content` is the decoded text and `raw_content` is absent. On failure
+      (binary data, malformed base64), `content` and `raw_content` both hold
+      the original base64 string, plus a `decode_error` note describing what
+      failed.
+    - decode=False: skip the decode attempt entirely. `content` stays base64
+      and `raw_content` mirrors it — use this when you know the resource is
+      binary and you want to pass the bytes through unchanged.
+
+    Arguments:
+      uri:    the full cog:// URI, e.g. "cog://adr/085".
+      decode: whether to base64 + UTF-8 decode the content (default True).
+    """
+    try:
+        resp = _http_get_any_with_params("/resolve", {"uri": uri})
+    except urllib.error.HTTPError as e:
+        body_raw = b""
+        try:
+            body_raw = e.read()
+        except Exception:
+            pass
+        body_text = body_raw.decode("utf-8", errors="replace") if body_raw else ""
+        kernel_error: Any = None
+        try:
+            parsed = json.loads(body_text) if body_text else None
+            if isinstance(parsed, dict):
+                kernel_error = parsed.get("error") or parsed
+        except json.JSONDecodeError:
+            pass
+        detail = f"HTTP {e.code} {e.reason}"
+        if kernel_error and isinstance(kernel_error, dict) and kernel_error.get("message"):
+            detail = f"{detail} — {kernel_error['message']}"
+        elif body_text:
+            detail = f"{detail} — {body_text}"
+        return {"success": False, "error": detail, "uri": uri}
+    except urllib.error.URLError as e:
+        return {"success": False, "error": f"{type(e).__name__}: {e}", "uri": uri}
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {e}", "uri": uri}
+
+    if not isinstance(resp, dict):
+        return {
+            "success": False,
+            "error": f"unexpected kernel response shape: {type(resp).__name__}",
+            "uri": uri,
+        }
+
+    raw_b64 = resp.get("content")
+    if not isinstance(raw_b64, str):
+        # Pass through whatever the kernel said — if there's no content field
+        # we don't have anything to decode and shouldn't pretend otherwise.
+        return dict(resp)
+
+    result = dict(resp)
+
+    if not decode:
+        result["content"] = raw_b64
+        result["raw_content"] = raw_b64
+        return result
+
+    try:
+        decoded_bytes = base64.b64decode(raw_b64, validate=True)
+    except (binascii.Error, ValueError) as e:
+        result["content"] = raw_b64
+        result["raw_content"] = raw_b64
+        result["decode_error"] = f"base64 decode failed: {e}"
+        return result
+
+    try:
+        result["content"] = decoded_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        result["content"] = raw_b64
+        result["raw_content"] = raw_b64
+        result["decode_error"] = f"utf-8 decode failed: {e}"
+
+    return result
+
+
 def register(mcp: FastMCP) -> None:
     """Register bridge tools with the MCP server.
 
@@ -291,3 +386,9 @@ def register(mcp: FastMCP) -> None:
             readOnlyHint=True, idempotentHint=True, openWorldHint=True
         ),
     )(cogos_events_read)
+    mcp.tool(
+        title="Resolve a cog:// URI",
+        annotations=ToolAnnotations(
+            readOnlyHint=True, idempotentHint=True, openWorldHint=True
+        ),
+    )(cogos_resolve)

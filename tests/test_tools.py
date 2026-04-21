@@ -280,6 +280,7 @@ def test_cogos_bridge_registered_when_enabled(
     assert "cogos_status" in names
     assert "cogos_emit" in names
     assert "cogos_events_read" in names
+    assert "cogos_resolve" in names
 
 
 def test_cogos_emit_not_registered_when_disabled(
@@ -535,3 +536,194 @@ def test_cogos_emit_then_read_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None
     assert event["from"] == "tester"
     assert event["type"] == "probe"
     assert event["payload"]["content"] == "ping"
+
+
+def test_cogos_resolve_not_registered_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setenv("COG_SANDBOX_ROOT", str(tmp_path))
+    monkeypatch.setenv("COG_SANDBOX_INITIAL_AUTH", "ws")
+    monkeypatch.delenv("COG_OS_BASE_URL", raising=False)
+    sandbox.initialize_auth()
+    from cog_sandbox_mcp.server import build_server
+    import asyncio
+    tools = asyncio.run(build_server().list_tools())
+    names = [t.name for t in tools]
+    assert "cogos_resolve" not in names
+
+
+def _start_resolve_mock(
+    handler_payload: dict[str, Any] | None = None,
+    status: int = 200,
+    raw_body: bytes | None = None,
+):
+    """Spin up a threaded HTTP server that captures /resolve requests.
+
+    Returns (server, captured_dict). Caller is responsible for server.shutdown().
+    """
+    import http.server
+    import threading
+    from urllib.parse import parse_qs, urlparse
+
+    captured: dict[str, Any] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            u = urlparse(self.path)
+            captured["path"] = u.path
+            captured["query"] = parse_qs(u.query)
+            captured["raw_query"] = u.query
+            if status >= 400:
+                body = raw_body or json.dumps(
+                    {"error": {"message": "bogus URI", "type": "not_found"}}
+                ).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = json.dumps(handler_payload or {}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, captured
+
+
+def test_cogos_resolve_decodes_base64_to_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64 as b64
+
+    text = "---\ntitle: ADR-085\n---\n\n# Body"
+    encoded = b64.b64encode(text.encode("utf-8")).decode("ascii")
+    server, captured = _start_resolve_mock(
+        {"uri": "cog://adr/085", "content": encoded, "etag": "abc123"}
+    )
+    try:
+        monkeypatch.setenv("COG_OS_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+        from cog_sandbox_mcp.tools import cogos_bridge
+
+        result = cogos_bridge.cogos_resolve("cog://adr/085")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert captured["path"] == "/resolve"
+    assert captured["query"] == {"uri": ["cog://adr/085"]}
+    assert result["uri"] == "cog://adr/085"
+    assert result["etag"] == "abc123"
+    assert result["content"] == text
+    assert "raw_content" not in result
+    assert "decode_error" not in result
+
+
+def test_cogos_resolve_no_decode_preserves_base64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64 as b64
+
+    encoded = b64.b64encode(b"binary-bytes-here").decode("ascii")
+    server, _ = _start_resolve_mock(
+        {"uri": "cog://blob/abc", "content": encoded}
+    )
+    try:
+        monkeypatch.setenv("COG_OS_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+        from cog_sandbox_mcp.tools import cogos_bridge
+
+        result = cogos_bridge.cogos_resolve("cog://blob/abc", decode=False)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["content"] == encoded
+    assert result["raw_content"] == encoded
+    assert "decode_error" not in result
+
+
+def test_cogos_resolve_falls_back_on_non_utf8_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64 as b64
+
+    # Random binary bytes that aren't valid UTF-8.
+    encoded = b64.b64encode(bytes([0xff, 0xfe, 0x00, 0x80])).decode("ascii")
+    server, _ = _start_resolve_mock(
+        {"uri": "cog://blob/xyz", "content": encoded}
+    )
+    try:
+        monkeypatch.setenv("COG_OS_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+        from cog_sandbox_mcp.tools import cogos_bridge
+
+        result = cogos_bridge.cogos_resolve("cog://blob/xyz")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["content"] == encoded
+    assert result["raw_content"] == encoded
+    assert "decode_error" in result
+    assert "utf-8" in result["decode_error"].lower()
+
+
+def test_cogos_resolve_returns_structured_error_on_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, _ = _start_resolve_mock(status=500)
+    try:
+        monkeypatch.setenv("COG_OS_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+        from cog_sandbox_mcp.tools import cogos_bridge
+
+        result = cogos_bridge.cogos_resolve("cog://nonsense/999")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["uri"] == "cog://nonsense/999"
+    assert "error" in result
+    # Kernel's error.message should be surfaced through the detail string.
+    assert "bogus URI" in result["error"]
+
+
+def test_cogos_resolve_url_quotes_special_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64 as b64
+
+    # URI with &, ?, and space — naive concatenation would break the
+    # querystring. Verify the tool url-encodes all of it and the mock server
+    # receives exactly one `uri` parameter with the full literal value.
+    gnarly = "cog://notes/2026-04-20?draft&title=Plan A"
+    encoded = b64.b64encode(b"hello").decode("ascii")
+    server, captured = _start_resolve_mock(
+        {"uri": gnarly, "content": encoded}
+    )
+    try:
+        monkeypatch.setenv("COG_OS_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+        from cog_sandbox_mcp.tools import cogos_bridge
+
+        result = cogos_bridge.cogos_resolve(gnarly)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert captured["query"] == {"uri": [gnarly]}
+    # Raw querystring must NOT contain a bare & or ? beyond the first separator —
+    # everything after `uri=` should be a single percent-encoded blob.
+    raw = captured["raw_query"]
+    assert raw.startswith("uri=")
+    assert raw.count("&") == 0
+    assert raw.count("?") == 0
+    assert result["content"] == "hello"

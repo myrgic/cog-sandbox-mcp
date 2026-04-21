@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.4 — 2026-04-20
+
+Fourth bridge tool: `cogos_resolve`. Read-only access to `cog://` URIs — ADRs, memory entries, any kernel-addressed resource. Handles the kernel's base64-over-JSON wire encoding with a decode contract that gracefully falls through on binary / malformed content.
+
+**New tool:**
+- `cogos_resolve(uri, decode=True)` — GETs `/resolve?uri=<url-encoded>` (no `/v1/` prefix — the kernel's resolve endpoint is at root). URI is URL-quoted via `urllib.parse.urlencode`, so cog:// URIs containing `&`, `?`, or spaces serialize safely. Returns the kernel's JSON with `content` replaced by the decoded text on success. On base64 or UTF-8 decode failure, falls back to `content=raw_content=<original base64>` plus a `decode_error` note — content is always present, never raising into the agent's loop. With `decode=False`, skips the decode entirely for binary payloads.
+- Kernel 500 errors (bogus URI, not found) parse the kernel's `{"error": {"message", "type"}}` payload and surface the message through the standard `{"success": False, "error": ..., "uri": ...}` structure.
+
+**Deferred to v0.3.5:** `cogos_mutate` (write access to cog:// via `POST /mutate`). Write exposure from a sandboxed agent to the cog:// graph has real blast-radius implications worth naming explicitly; v0.3.4 stays read-only as the conservative default.
+
+**Tests:** 44/44 passing (was 38/38 on v0.3.3). New coverage:
+- Base64 → UTF-8 decode round-trip against a mock resolve endpoint.
+- `decode=False` path preserves the base64 in both `content` and `raw_content`.
+- Non-UTF-8 binary payload falls back cleanly with a `decode_error` note.
+- HTTP 500 from the kernel surfaces the error message through the structured-error shape with `uri` echoed back.
+- URL-quoting: a URI containing `&`, `?`, and a space serializes as exactly one `uri=<percent-encoded>` parameter with no bare `&` or `?` in the query string.
+- Registration visibility: present when bridge enabled, absent when disabled.
+
+**Cross-LAN smoke:** [scripts/smoke_bridge.py](scripts/smoke_bridge.py) extended to resolve `cog://adr/085` against the laptop kernel and assert the content starts with markdown frontmatter (`---`).
+
+**No breaking changes** to the v0.3.3 tool surface. All previously-passing tests continue to pass.
+
 ## 0.3.3 — 2026-04-20
 
 Third bridge tool: `cogos_events_read`. Closes the emit/read roundtrip — agents can now verify their own emits, tail a bus, or filter by type/sender to focus on specific signals. Same conditional-registration pattern, same never-raise contract.

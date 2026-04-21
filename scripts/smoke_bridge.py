@@ -4,14 +4,17 @@ Smoke-test the cog-sandbox MCP server's Cog OS bridge over stdio.
 Spawns the podman container with the same args LM Studio uses (per
 ~/.cache/lm-studio/mcp.json), speaks MCP JSON-RPC on stdio, and:
 
-  1. Lists tools — expects cogos_status, cogos_emit, and cogos_events_read
-     (confirms bridge registration saw COG_OS_BASE_URL at import time).
+  1. Lists tools — expects cogos_status, cogos_emit, cogos_events_read,
+     and cogos_resolve (confirms bridge registration saw COG_OS_BASE_URL
+     at import time).
   2. Calls cogos_status — expects reachable=true, proving the container
      can reach the configured kernel URL.
   3. Calls cogos_emit against a probe bus — expects the kernel's JSON
      response (or a structured error, but never an unhandled raise).
   4. Calls cogos_events_read on the same bus — expects the emit's seq to
      appear in the returned events (the roundtrip assertion).
+  5. Calls cogos_resolve on a known cog:// URI (an ADR committed on the
+     laptop workspace) — expects base64-decoded markdown content.
 
 Run:
     python scripts/smoke_bridge.py
@@ -31,6 +34,7 @@ COG_OS_URL = "http://192.168.10.140:5100"
 INITIAL_AUTH = "cog-workspace"
 PROBE_BUS_ID = "agent-smoke-test"
 PROBE_MESSAGE = "hello from desktop"
+PROBE_URI = "cog://adr/085"  # decomposition ADR committed on the laptop workspace
 
 
 def _jsonrpc(method: str, params: dict | None, rpc_id: int | None) -> bytes:
@@ -99,7 +103,7 @@ def main() -> int:
         names = sorted(t["name"] for t in tools)
         _log(f"[smoke] {len(names)} tools: {names}")
 
-        required = {"cogos_status", "cogos_emit", "cogos_events_read"}
+        required = {"cogos_status", "cogos_emit", "cogos_events_read", "cogos_resolve"}
         missing = required - set(names)
         if missing:
             _log(f"[smoke] FAIL: bridge tools missing: {sorted(missing)} — COG_OS_BASE_URL didn't reach the container")
@@ -193,7 +197,31 @@ def main() -> int:
         else:
             _log(f"[smoke] WARN: emit response didn't include 'seq'; skipping strict seq check")
 
-        _log(f"[smoke] PASS — status reachable; emit→read roundtrip on {PROBE_BUS_ID}")
+        # ---- 4) cogos_resolve (read a known cog:// URI) ----
+        proc.stdin.write(_jsonrpc("tools/call", {
+            "name": "cogos_resolve",
+            "arguments": {"uri": PROBE_URI},
+        }, 6))
+        proc.stdin.flush()
+        resolve_res = _read_response(proc, 6, timeout=20.0).get("result", {})
+        _log("[smoke] cogos_resolve result (structured content below):")
+        resolve_struct = resolve_res.get("structuredContent") or {}
+        print(json.dumps(resolve_struct, indent=2), flush=True)
+
+        if resolve_struct.get("success") is False:
+            _log(f"[smoke] FAIL: cogos_resolve({PROBE_URI}) returned error: {resolve_struct.get('error')}")
+            return 10
+
+        content = resolve_struct.get("content")
+        if not isinstance(content, str) or not content:
+            _log(f"[smoke] FAIL: cogos_resolve({PROBE_URI}) returned no content")
+            return 11
+        if not content.startswith("---"):
+            _log(f"[smoke] FAIL: expected markdown frontmatter, got leading {content[:40]!r}")
+            return 12
+
+        _log(f"[smoke] resolve OK — {PROBE_URI} decoded to markdown ({len(content)} chars, frontmatter present)")
+        _log(f"[smoke] PASS — status reachable; emit→read roundtrip on {PROBE_BUS_ID}; resolve works")
         return 0
 
     finally:
