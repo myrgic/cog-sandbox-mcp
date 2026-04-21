@@ -2,6 +2,8 @@
 
 Conventions for writing new bridge tools in `src/cog_sandbox_mcp/tools/cogos_bridge.py`. Derived from v0.3.1–0.3.4 (`cogos_status`, `cogos_emit`, `cogos_events_read`, `cogos_resolve`).
 
+> Transport-agnostic: these tools are registered on the same `FastMCP` instance regardless of whether the server is running in stdio or HTTP mode. See the "HTTP transport" section of [`README.md`](../README.md) for how to run a shared HTTP server that multiple Claude Code sessions connect to via `mcp-remote`.
+
 ## Registration
 
 Tools are registered **iff `COG_OS_BASE_URL` is set at server startup.** The `register()` function gates on `is_bridge_enabled()` and returns early when the env var is missing. Don't gate inside each tool — the whole suite either appears or doesn't.
