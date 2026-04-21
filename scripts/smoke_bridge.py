@@ -4,12 +4,14 @@ Smoke-test the cog-sandbox MCP server's Cog OS bridge over stdio.
 Spawns the podman container with the same args LM Studio uses (per
 ~/.cache/lm-studio/mcp.json), speaks MCP JSON-RPC on stdio, and:
 
-  1. Lists tools — expects cogos_status and cogos_emit to be present
+  1. Lists tools — expects cogos_status, cogos_emit, and cogos_events_read
      (confirms bridge registration saw COG_OS_BASE_URL at import time).
   2. Calls cogos_status — expects reachable=true, proving the container
      can reach the configured kernel URL.
   3. Calls cogos_emit against a probe bus — expects the kernel's JSON
      response (or a structured error, but never an unhandled raise).
+  4. Calls cogos_events_read on the same bus — expects the emit's seq to
+     appear in the returned events (the roundtrip assertion).
 
 Run:
     python scripts/smoke_bridge.py
@@ -97,7 +99,7 @@ def main() -> int:
         names = sorted(t["name"] for t in tools)
         _log(f"[smoke] {len(names)} tools: {names}")
 
-        required = {"cogos_status", "cogos_emit"}
+        required = {"cogos_status", "cogos_emit", "cogos_events_read"}
         missing = required - set(names)
         if missing:
             _log(f"[smoke] FAIL: bridge tools missing: {sorted(missing)} — COG_OS_BASE_URL didn't reach the container")
@@ -160,8 +162,38 @@ def main() -> int:
                  f"Check laptop: curl {COG_OS_URL}/v1/bus/{PROBE_BUS_ID}/events")
             return 6
 
-        _log(f"[smoke] PASS — cogos_status reached kernel; cogos_emit posted to {PROBE_BUS_ID}")
-        _log(f"[smoke] verify on laptop: curl http://127.0.0.1:6931/v1/bus/{PROBE_BUS_ID}/events")
+        emitted_seq = payload.get("seq") if isinstance(payload, dict) else None
+
+        # ---- 3) cogos_events_read (roundtrip assertion) ----
+        proc.stdin.write(_jsonrpc("tools/call", {
+            "name": "cogos_events_read",
+            "arguments": {"bus_id": PROBE_BUS_ID, "limit": 10},
+        }, 5))
+        proc.stdin.flush()
+        read_res = _read_response(proc, 5, timeout=20.0).get("result", {})
+        _log("[smoke] cogos_events_read result:")
+        print(json.dumps(read_res, indent=2), flush=True)
+
+        read_struct = read_res.get("structuredContent") or {}
+        if read_struct.get("success") is False:
+            _log(f"[smoke] FAIL: cogos_events_read returned error: {read_struct.get('error')}")
+            return 7
+
+        events = read_struct.get("events") or []
+        if not events:
+            _log(f"[smoke] FAIL: events list for {PROBE_BUS_ID} was empty after emit")
+            return 8
+
+        if emitted_seq is not None:
+            seqs = [e.get("seq") for e in events]
+            if emitted_seq not in seqs:
+                _log(f"[smoke] FAIL: emitted seq={emitted_seq} not found in events (saw {seqs})")
+                return 9
+            _log(f"[smoke] roundtrip OK — emitted seq={emitted_seq} present in {len(events)} events")
+        else:
+            _log(f"[smoke] WARN: emit response didn't include 'seq'; skipping strict seq check")
+
+        _log(f"[smoke] PASS — status reachable; emit→read roundtrip on {PROBE_BUS_ID}")
         return 0
 
     finally:

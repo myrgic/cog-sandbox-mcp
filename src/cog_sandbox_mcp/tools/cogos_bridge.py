@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -49,6 +50,38 @@ def _http_get_json(path: str, timeout_s: float = 10.0) -> dict[str, Any]:
         body = resp.read().decode("utf-8", errors="replace")
     try:
         return json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return {"_raw": body}
+
+
+def _http_get_any_with_params(
+    path: str,
+    params: dict[str, Any] | None = None,
+    timeout_s: float = 10.0,
+) -> Any:
+    """GET JSON with optional query-string params.
+
+    Returns whatever the kernel returns (dict, list, or scalar) — the caller
+    owns shape validation. Keys with None or "" values are skipped so callers
+    can pass Optional filters straight through without pre-filtering.
+    """
+    base = _base_url()
+    if not base:
+        raise RuntimeError(
+            "COG_OS_BASE_URL is not set; bridge tools should not have been registered"
+        )
+    url = f"{base}{path}"
+    if params:
+        qs = urllib.parse.urlencode(
+            {k: v for k, v in params.items() if v is not None and v != ""}
+        )
+        if qs:
+            url = f"{url}?{qs}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    try:
+        return json.loads(body) if body else None
     except json.JSONDecodeError:
         return {"_raw": body}
 
@@ -161,6 +194,76 @@ def cogos_emit(
         }
 
 
+def cogos_events_read(
+    bus_id: str,
+    after_seq: int | None = None,
+    event_type: str | None = None,
+    from_sender: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Read events from a Cog OS bus (read-only; does NOT create the bus).
+
+    GETs {COG_OS_BASE_URL}/v1/bus/{bus_id}/events with optional filters. Wraps
+    the kernel's event array as {"bus_id", "events", "count"}. On failure —
+    including 404 if the bus does not exist — returns {"success": False,
+    "error": ..., "bus_id": ...} rather than raising.
+
+    CALL THIS WHEN you need to inspect what has been emitted to a named bus —
+    for example to verify a previous cogos_emit landed, replay recent events
+    for context, or filter by type/sender to focus on specific signals.
+
+    Unlike cogos_emit (which auto-creates the bus on first emit), this tool is
+    purely read — it WILL NOT create a bus that does not exist. A 404 here
+    almost always means the bus_id is wrong (typo, or never emitted to) rather
+    than an environmental failure.
+
+    Arguments:
+      bus_id:       the channel to read (e.g. "agent-smoke-test").
+      after_seq:    if set, only events with seq > this value (for tailing).
+      event_type:   filter to a specific event type tag (e.g. "message").
+      from_sender:  filter to a specific emitter identity.
+      limit:        max events to return (default 100, kernel-side cap).
+    """
+    params: dict[str, Any] = {"limit": limit}
+    if after_seq is not None:
+        params["after"] = after_seq
+    if event_type:
+        params["type"] = event_type
+    if from_sender:
+        params["from"] = from_sender
+    try:
+        events = _http_get_any_with_params(f"/v1/bus/{bus_id}/events", params)
+        if not isinstance(events, list):
+            return {
+                "success": False,
+                "error": f"unexpected kernel response shape: {type(events).__name__}",
+                "bus_id": bus_id,
+            }
+        return {"bus_id": bus_id, "events": events, "count": len(events)}
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        detail = f"HTTP {e.code} {e.reason}"
+        if body:
+            detail = f"{detail} — {body}"
+        return {"success": False, "error": detail, "bus_id": bus_id}
+    except urllib.error.URLError as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "bus_id": bus_id,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "bus_id": bus_id,
+        }
+
+
 def register(mcp: FastMCP) -> None:
     """Register bridge tools with the MCP server.
 
@@ -182,3 +285,9 @@ def register(mcp: FastMCP) -> None:
             readOnlyHint=False, idempotentHint=False, openWorldHint=True
         ),
     )(cogos_emit)
+    mcp.tool(
+        title="Read events from Cog OS bus",
+        annotations=ToolAnnotations(
+            readOnlyHint=True, idempotentHint=True, openWorldHint=True
+        ),
+    )(cogos_events_read)

@@ -279,6 +279,7 @@ def test_cogos_bridge_registered_when_enabled(
     names = [t.name for t in tools]
     assert "cogos_status" in names
     assert "cogos_emit" in names
+    assert "cogos_events_read" in names
 
 
 def test_cogos_emit_not_registered_when_disabled(
@@ -364,3 +365,173 @@ def test_cogos_emit_returns_structured_error_on_unreachable(
     assert result["success"] is False
     assert "error" in result
     assert result["bus_id"] == "abandoned"
+
+
+def test_cogos_events_read_not_registered_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setenv("COG_SANDBOX_ROOT", str(tmp_path))
+    monkeypatch.setenv("COG_SANDBOX_INITIAL_AUTH", "ws")
+    monkeypatch.delenv("COG_OS_BASE_URL", raising=False)
+    sandbox.initialize_auth()
+    from cog_sandbox_mcp.server import build_server
+    import asyncio
+    tools = asyncio.run(build_server().list_tools())
+    names = [t.name for t in tools]
+    assert "cogos_events_read" not in names
+
+
+def test_cogos_events_read_gets_with_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Mock server asserts path + query-string serialization, replies with a
+    # canned events list so we can verify the {bus_id, events, count} wrapper.
+    import http.server
+    import threading
+    from urllib.parse import parse_qs, urlparse
+
+    captured: dict[str, Any] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 — stdlib name
+            u = urlparse(self.path)
+            captured["path"] = u.path
+            captured["query"] = parse_qs(u.query)
+            events = [
+                {"seq": 1, "type": "message", "from": "a", "payload": {"content": "one"}},
+                {"seq": 2, "type": "message", "from": "a", "payload": {"content": "two"}},
+            ]
+            body = json.dumps(events).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("COG_OS_BASE_URL", f"http://127.0.0.1:{port}")
+        from cog_sandbox_mcp.tools import cogos_bridge
+
+        result = cogos_bridge.cogos_events_read(
+            bus_id="my-bus",
+            after_seq=5,
+            event_type="message",
+            from_sender="alice",
+            limit=25,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert captured["path"] == "/v1/bus/my-bus/events"
+    # urllib query parse returns list values.
+    assert captured["query"] == {
+        "limit": ["25"],
+        "after": ["5"],
+        "type": ["message"],
+        "from": ["alice"],
+    }
+    assert result["bus_id"] == "my-bus"
+    assert result["count"] == 2
+    assert result["events"][0]["payload"]["content"] == "one"
+
+
+def test_cogos_events_read_returns_structured_error_on_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COG_OS_BASE_URL", "http://127.0.0.1:1")
+    from cog_sandbox_mcp.tools import cogos_bridge
+
+    result = cogos_bridge.cogos_events_read(bus_id="nowhere")
+    assert result["success"] is False
+    assert "error" in result
+    assert result["bus_id"] == "nowhere"
+
+
+def test_cogos_emit_then_read_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Single mock kernel that accepts POSTs to /v1/bus/send (appends) and GETs
+    # to /v1/bus/<id>/events (returns current list for that bus). Verifies the
+    # emit → read loop end-to-end against our own wrapper logic.
+    import http.server
+    import threading
+    from urllib.parse import urlparse
+
+    buses: dict[str, list[dict[str, Any]]] = {}
+    seq_counter = {"n": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path != "/v1/bus/send":
+                self.send_response(404); self.end_headers(); return
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            seq_counter["n"] += 1
+            event = {
+                "seq": seq_counter["n"],
+                "bus_id": body["bus_id"],
+                "type": body.get("type"),
+                "from": body.get("from"),
+                "payload": {"content": body["message"]},
+            }
+            buses.setdefault(body["bus_id"], []).append(event)
+            resp = json.dumps({"ok": True, "seq": event["seq"]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        def do_GET(self) -> None:  # noqa: N802
+            u = urlparse(self.path)
+            parts = u.path.split("/")
+            # /v1/bus/<id>/events
+            if len(parts) != 5 or parts[:3] != ["", "v1", "bus"] or parts[4] != "events":
+                self.send_response(404); self.end_headers(); return
+            bus_id = parts[3]
+            events = list(buses.get(bus_id, []))
+            body = json.dumps(events).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("COG_OS_BASE_URL", f"http://127.0.0.1:{port}")
+        from cog_sandbox_mcp.tools import cogos_bridge
+
+        emit_result = cogos_bridge.cogos_emit(
+            bus_id="round-trip",
+            message="ping",
+            from_sender="tester",
+            event_type="probe",
+        )
+        read_result = cogos_bridge.cogos_events_read(bus_id="round-trip")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert emit_result == {"ok": True, "seq": 1}
+    assert read_result["bus_id"] == "round-trip"
+    assert read_result["count"] == 1
+    event = read_result["events"][0]
+    assert event["seq"] == 1
+    assert event["from"] == "tester"
+    assert event["type"] == "probe"
+    assert event["payload"]["content"] == "ping"

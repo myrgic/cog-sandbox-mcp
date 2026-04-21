@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.3 — 2026-04-20
+
+Third bridge tool: `cogos_events_read`. Closes the emit/read roundtrip — agents can now verify their own emits, tail a bus, or filter by type/sender to focus on specific signals. Same conditional-registration pattern, same never-raise contract.
+
+**New tool:**
+- `cogos_events_read(bus_id, after_seq=None, event_type=None, from_sender=None, limit=100)` — GETs `/v1/bus/{bus_id}/events` with query-string filters. Wraps the kernel's event array as `{"bus_id", "events", "count"}`. On failure (including 404 if the bus does not exist), returns a structured error. Does NOT auto-create the bus — explicitly documented to distinguish from `cogos_emit`.
+
+**New helper:**
+- `_http_get_any_with_params(path, params)` — GET + JSON decode, returning `Any` (the kernel's bus-events endpoint returns a bare list). `None`/`""` params are filtered so callers can pass Optional filters through directly.
+
+**Tests:** 38/38 passing (was 34/34 on v0.3.2). New coverage:
+- `cogos_events_read` path + query-string serialization against a threaded mock HTTP server, including all four filter params (`after`, `type`, `from`, `limit`).
+- Registration visibility: present when bridge enabled, absent when disabled.
+- Structured-error contract against a closed port.
+- **Roundtrip integration test**: a single mock kernel accepts POST `/v1/bus/send` (appends with monotonic seq) and GET `/v1/bus/{id}/events` (returns the list); emit → read sees the event back with the right seq/type/from/payload.
+
+**Cross-LAN smoke:** [scripts/smoke_bridge.py](scripts/smoke_bridge.py) extended — after emit, it now reads the same bus and asserts the emit's `seq` appears in the results.
+
+**No breaking changes** to the v0.3.2 tool surface. All previously-passing tests continue to pass.
+
 ## 0.3.2 — 2026-04-20
 
 Second bridge tool: `cogos_emit`. Same conditional-registration pattern as `cogos_status` — only appears when `COG_OS_BASE_URL` is set — and the same never-raise contract on failure, so agents can call it as a safe side-effect without needing exception handling.
