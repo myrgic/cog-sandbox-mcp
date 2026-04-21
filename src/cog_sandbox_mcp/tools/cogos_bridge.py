@@ -102,6 +102,65 @@ def cogos_status() -> dict[str, Any]:
         }
 
 
+def cogos_emit(
+    bus_id: str,
+    message: str,
+    from_sender: str = "cog-sandbox",
+    event_type: str = "message",
+) -> dict[str, Any]:
+    """Emit an event onto a Cog OS bus channel.
+
+    POSTs to the kernel's /v1/bus/send endpoint. On success, returns the kernel's
+    JSON response verbatim (typically includes an event id / acknowledgement).
+    On failure, returns a structured {"success": False, "error": ..., "bus_id":
+    ...} payload rather than raising — same safe-probe contract as cogos_status.
+
+    CALL THIS WHEN the user or the agent's own task requires sending a message,
+    status update, or event onto a named Cog OS bus that downstream subsystems
+    (other agents, external bridges, logs) subscribe to. If you do not know the
+    bus_id, ask the user — do not invent one.
+
+    Arguments:
+      bus_id:      the channel name (e.g. "agent-smoke-test", "assistant-turns").
+      message:     the event payload's human-readable text body.
+      from_sender: identifier for the emitter (default "cog-sandbox"). Set this
+                   to a more specific handle when emitting on behalf of a named
+                   sub-agent or user.
+      event_type:  the event type tag (default "message"). Use this to classify
+                   events for downstream filtering.
+    """
+    payload: dict[str, Any] = {
+        "bus_id": bus_id,
+        "message": message,
+        "from": from_sender,
+        "type": event_type,
+    }
+    try:
+        return _http_post_json("/v1/bus/send", payload)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        detail = f"HTTP {e.code} {e.reason}"
+        if body:
+            detail = f"{detail} — {body}"
+        return {"success": False, "error": detail, "bus_id": bus_id}
+    except urllib.error.URLError as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "bus_id": bus_id,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "bus_id": bus_id,
+        }
+
+
 def register(mcp: FastMCP) -> None:
     """Register bridge tools with the MCP server.
 
@@ -117,3 +176,9 @@ def register(mcp: FastMCP) -> None:
             readOnlyHint=True, idempotentHint=True, openWorldHint=True
         ),
     )(cogos_status)
+    mcp.tool(
+        title="Emit event to Cog OS bus",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_emit)

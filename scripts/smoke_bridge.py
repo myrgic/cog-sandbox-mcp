@@ -4,10 +4,12 @@ Smoke-test the cog-sandbox MCP server's Cog OS bridge over stdio.
 Spawns the podman container with the same args LM Studio uses (per
 ~/.cache/lm-studio/mcp.json), speaks MCP JSON-RPC on stdio, and:
 
-  1. Lists tools — expects cogos_status to be present (confirms the
-     bridge-registration path saw COG_OS_BASE_URL at import time).
-  2. Calls cogos_status — expects a structured payload pointing at the
-     laptop kernel, proving the container can actually reach the URL.
+  1. Lists tools — expects cogos_status and cogos_emit to be present
+     (confirms bridge registration saw COG_OS_BASE_URL at import time).
+  2. Calls cogos_status — expects reachable=true, proving the container
+     can reach the configured kernel URL.
+  3. Calls cogos_emit against a probe bus — expects the kernel's JSON
+     response (or a structured error, but never an unhandled raise).
 
 Run:
     python scripts/smoke_bridge.py
@@ -25,6 +27,8 @@ IMAGE = "cog-sandbox-mcp:0.1"
 WORKSPACE_MOUNT = r"C:\Users\chazm\work:/workspace:rw"
 COG_OS_URL = "http://192.168.10.140:5100"
 INITIAL_AUTH = "cog-workspace"
+PROBE_BUS_ID = "agent-smoke-test"
+PROBE_MESSAGE = "hello from desktop"
 
 
 def _jsonrpc(method: str, params: dict | None, rpc_id: int | None) -> bytes:
@@ -93,31 +97,72 @@ def main() -> int:
         names = sorted(t["name"] for t in tools)
         _log(f"[smoke] {len(names)} tools: {names}")
 
-        if "cogos_status" not in names:
-            _log("[smoke] FAIL: cogos_status not registered — COG_OS_BASE_URL didn't reach the container")
+        required = {"cogos_status", "cogos_emit"}
+        missing = required - set(names)
+        if missing:
+            _log(f"[smoke] FAIL: bridge tools missing: {sorted(missing)} — COG_OS_BASE_URL didn't reach the container")
             return 2
 
+        # ---- 1) cogos_status (read probe) ----
         proc.stdin.write(_jsonrpc("tools/call", {
             "name": "cogos_status",
             "arguments": {},
         }, 3))
         proc.stdin.flush()
-        call_res = _read_response(proc, 3, timeout=20.0).get("result", {})
+        status_res = _read_response(proc, 3, timeout=20.0).get("result", {})
         _log("[smoke] cogos_status result:")
-        print(json.dumps(call_res, indent=2), flush=True)
+        print(json.dumps(status_res, indent=2), flush=True)
 
-        content = call_res.get("content", [])
-        payload_text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
-        if "reachable" not in payload_text:
-            _log("[smoke] FAIL: result didn't look like a bridge payload")
+        status_text = "".join(
+            c.get("text", "")
+            for c in status_res.get("content", [])
+            if c.get("type") == "text"
+        )
+        if "reachable" not in status_text:
+            _log("[smoke] FAIL: cogos_status result didn't look like a bridge payload")
             return 3
-
-        if '"reachable": true' in payload_text or '"reachable":true' in payload_text:
-            _log("[smoke] PASS - bridge reached the laptop kernel")
-            return 0
-        else:
+        if not ('"reachable": true' in status_text or '"reachable":true' in status_text):
             _log("[smoke] FAIL: bridge registered but couldn't reach kernel")
             return 4
+
+        # ---- 2) cogos_emit (write probe) ----
+        proc.stdin.write(_jsonrpc("tools/call", {
+            "name": "cogos_emit",
+            "arguments": {
+                "bus_id": PROBE_BUS_ID,
+                "message": PROBE_MESSAGE,
+                "from_sender": "desktop-smoke",
+                "event_type": "smoke",
+            },
+        }, 4))
+        proc.stdin.flush()
+        emit_res = _read_response(proc, 4, timeout=20.0).get("result", {})
+        _log("[smoke] cogos_emit result:")
+        print(json.dumps(emit_res, indent=2), flush=True)
+
+        emit_text = "".join(
+            c.get("text", "")
+            for c in emit_res.get("content", [])
+            if c.get("type") == "text"
+        )
+        if not emit_text:
+            _log("[smoke] FAIL: cogos_emit returned no content")
+            return 5
+        # Accept either the kernel's verbatim response or a structured error.
+        # The contract is: never raise unhandled, always structured JSON.
+        try:
+            payload = json.loads(emit_text) if emit_text.strip().startswith("{") else None
+        except json.JSONDecodeError:
+            payload = None
+        if payload and payload.get("success") is False:
+            _log(f"[smoke] WARN: cogos_emit returned structured error: {payload.get('error')}")
+            _log("[smoke] PARTIAL — tools registered + status reachable, but emit failed. "
+                 f"Check laptop: curl {COG_OS_URL}/v1/bus/{PROBE_BUS_ID}/events")
+            return 6
+
+        _log(f"[smoke] PASS — cogos_status reached kernel; cogos_emit posted to {PROBE_BUS_ID}")
+        _log(f"[smoke] verify on laptop: curl http://127.0.0.1:6931/v1/bus/{PROBE_BUS_ID}/events")
+        return 0
 
     finally:
         proc.stdin.close()

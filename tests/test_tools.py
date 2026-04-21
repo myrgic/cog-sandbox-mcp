@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -276,3 +278,89 @@ def test_cogos_bridge_registered_when_enabled(
     tools = asyncio.run(build_server().list_tools())
     names = [t.name for t in tools]
     assert "cogos_status" in names
+    assert "cogos_emit" in names
+
+
+def test_cogos_emit_not_registered_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setenv("COG_SANDBOX_ROOT", str(tmp_path))
+    monkeypatch.setenv("COG_SANDBOX_INITIAL_AUTH", "ws")
+    monkeypatch.delenv("COG_OS_BASE_URL", raising=False)
+    sandbox.initialize_auth()
+    from cog_sandbox_mcp.server import build_server
+    import asyncio
+    tools = asyncio.run(build_server().list_tools())
+    names = [t.name for t in tools]
+    assert "cogos_emit" not in names
+
+
+def test_cogos_emit_posts_bus_send_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Stand up a tiny HTTP server, point the bridge at it, emit once, verify
+    # that the wire path + body + response pass through faithfully.
+    import http.server
+    import threading
+
+    captured: dict[str, Any] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 — stdlib name
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            captured["path"] = self.path
+            captured["body"] = json.loads(body)
+            resp = json.dumps({"success": True, "event_id": "evt-123"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        def log_message(self, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
+            pass  # silence per-request logging in the test output
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("COG_OS_BASE_URL", f"http://127.0.0.1:{port}")
+        from cog_sandbox_mcp.tools import cogos_bridge
+
+        result = cogos_bridge.cogos_emit(
+            bus_id="test-bus",
+            message="hello from test",
+            from_sender="pytest",
+            event_type="smoke",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert captured["path"] == "/v1/bus/send"
+    assert captured["body"] == {
+        "bus_id": "test-bus",
+        "message": "hello from test",
+        "from": "pytest",
+        "type": "smoke",
+    }
+    # Kernel's response comes back verbatim on success.
+    assert result == {"success": True, "event_id": "evt-123"}
+
+
+def test_cogos_emit_returns_structured_error_on_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Closed port — should come back as a structured error, not raise, so the
+    # agent can reason about the failure without trampolining out of its loop.
+    monkeypatch.setenv("COG_OS_BASE_URL", "http://127.0.0.1:1")
+    from cog_sandbox_mcp.tools import cogos_bridge
+
+    result = cogos_bridge.cogos_emit(bus_id="abandoned", message="into the void")
+    assert result["success"] is False
+    assert "error" in result
+    assert result["bus_id"] == "abandoned"

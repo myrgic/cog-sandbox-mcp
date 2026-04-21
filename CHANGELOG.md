@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.2 — 2026-04-20
+
+Second bridge tool: `cogos_emit`. Same conditional-registration pattern as `cogos_status` — only appears when `COG_OS_BASE_URL` is set — and the same never-raise contract on failure, so agents can call it as a safe side-effect without needing exception handling.
+
+**New tool:**
+- `cogos_emit(bus_id, message, from_sender="cog-sandbox", event_type="message")` — POSTs to the kernel's `/v1/bus/send`. On success, returns the kernel's JSON response verbatim. On failure (unreachable host, HTTP error, any exception), returns `{"success": False, "error": ..., "bus_id": ...}` without raising.
+
+**Tests:** 34/34 passing (was 31/31 on v0.3.1). New coverage:
+- `cogos_emit` posts the correct path + payload shape against a threaded mock HTTP server and surfaces the kernel's response verbatim.
+- Unreachable-host handling returns a structured error rather than raising.
+- Registration visibility: `cogos_emit` present when bridge is enabled, absent when disabled.
+
+**Cross-LAN smoke:** [scripts/smoke_bridge.py](scripts/smoke_bridge.py) extended to exercise `cogos_emit` end-to-end against a remote kernel after the `cogos_status` probe.
+
+**No breaking changes** to the v0.3.1 tool surface. All previously-passing tests continue to pass.
+
 ## 0.3.1 — 2026-04-20
 
 Iteration on v0.3: description pass to address a drift behavior surfaced by the eval harness, plus the scaffold for v0.4's `cogos_*` bridge layer so future work builds on the mediator/kernel layering.
