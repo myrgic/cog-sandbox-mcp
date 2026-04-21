@@ -21,13 +21,42 @@ import base64
 import binascii
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+
+
+# Well-known bus names reserved by the handoff protocol. See
+# docs/HANDOFF_PROTOCOL.md §Well-known buses. Users can still emit to other
+# buses for domain channels; these are the substrate-reserved ones.
+BUS_SESSIONS = "bus_sessions"
+BUS_HANDOFFS = "bus_handoffs"
+
+
+def _utc_now_iso() -> str:
+    """RFC3339-ish UTC timestamp suitable for created_at / claimed_at fields."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _new_handoff_id() -> str:
+    """Generate a handoff identifier.
+
+    Protocol recommends ULIDs for sortability; we fall back to a timestamp-
+    prefixed uuid4 suffix since ulid is not a runtime dep. Format:
+    ``ho-<unix-ms>-<uuid4 short>`` — monotonic by emit time within a single
+    process, good enough for the first-wins-by-seq guarantee which is actually
+    enforced by the kernel's event sequence anyway.
+    """
+    ms = int(time.time() * 1000)
+    suffix = uuid.uuid4().hex[:12]
+    return f"ho-{ms}-{suffix}"
 
 
 def _base_url() -> str | None:
@@ -359,6 +388,606 @@ def cogos_resolve(uri: str, decode: bool = True) -> dict[str, Any]:
     return result
 
 
+def cogos_session_register(
+    session_id: str,
+    workspace: str,
+    role: str,
+    task: str,
+    model: str | None = None,
+    hostname: str | None = None,
+) -> dict[str, Any]:
+    """Announce a session's presence on the shared ``bus_sessions`` channel.
+
+    Emits a ``session.register`` event with a JSON payload per
+    docs/HANDOFF_PROTOCOL.md §Session lifecycle. Delegates to ``cogos_emit`` so
+    the never-raise contract (structured ``{"success": False, ...}`` on failure)
+    is inherited automatically. The event's ``from`` field is set to
+    ``session_id`` so all downstream emissions are attributable to this session.
+
+    CALL THIS WHEN a new agent session comes online and wants to participate in
+    the cross-session substrate — e.g. at the top of a Claude Code session that
+    may later receive a handoff, coordinate with other sessions, or emit
+    heartbeats. Pair with ``cogos_session_heartbeat`` on an interval and
+    ``cogos_session_end`` at teardown. If you do not know the ``session_id``,
+    construct one per the protocol (``<hostname>-<workspace-slug>-<role-or-
+    ulid>``) — do not invent arbitrary identifiers; ask the user if unsure.
+
+    Arguments:
+      session_id: stable identifier for this session (ASCII, lowercase,
+                  ``[a-z0-9-]``). Used as ``from`` on every emit from this
+                  session.
+      workspace:  absolute path to the working directory / repo root this
+                  session is operating in.
+      role:       human-meaningful role label ("manager", "worker-1",
+                  "researcher"). Free-form string.
+      task:       one-line description of what this session is doing.
+      model:      optional model identifier (e.g. "claude-opus-4-7"). Helpful
+                  for cross-session triage; omit if unknown.
+      hostname:   optional hostname; recommended when multiple machines
+                  participate in the same bus.
+
+    Contract: returns whatever ``cogos_emit`` returns — the kernel's response
+    verbatim on success, or a ``{"success": False, "error": ..., "bus_id":
+    "bus_sessions"}`` payload on failure.
+    """
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "workspace": workspace,
+        "role": role,
+        "task": task,
+        "started_at": _utc_now_iso(),
+    }
+    if model is not None:
+        payload["model"] = model
+    if hostname is not None:
+        payload["hostname"] = hostname
+    return cogos_emit(
+        bus_id=BUS_SESSIONS,
+        message=json.dumps(payload),
+        from_sender=session_id,
+        event_type="session.register",
+    )
+
+
+def cogos_session_heartbeat(
+    session_id: str,
+    status: str = "active",
+    context_usage: float | None = None,
+    current_task: str | None = None,
+) -> dict[str, Any]:
+    """Emit a periodic keep-alive for the session's presence.
+
+    Emits ``session.heartbeat`` on ``bus_sessions`` per HANDOFF_PROTOCOL.md.
+    Downstream roster queries (``cogos_sessions_list``) infer liveness from the
+    presence of a recent heartbeat. Sessions typically heartbeat every ~5
+    minutes; absence of a heartbeat for 2× interval marks the session inactive.
+
+    CALL THIS WHEN the agent wants to signal "still alive / working" so peers
+    and dashboards see the session as active, or to publish a status transition
+    (``active`` → ``idle`` / ``paused`` / ``ending``). Also useful for
+    surfacing context_usage so handoff tooling can decide when to trigger a
+    handoff before exhaustion.
+
+    Arguments:
+      session_id:     this session's identifier — must match the one registered
+                      via ``cogos_session_register``.
+      status:         one of ``"active" | "idle" | "paused" | "ending"``. Not
+                      validated at client; passed through to the payload.
+      context_usage:  fraction of context used in ``[0.0, 1.0]``. Optional.
+      current_task:   short string describing what the session is doing right
+                      now. Optional.
+
+    Contract: returns whatever ``cogos_emit`` returns. Structured error on
+    failure; does not raise.
+    """
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "status": status,
+        "last_tool_use_at": _utc_now_iso(),
+    }
+    if context_usage is not None:
+        payload["context_usage"] = context_usage
+    if current_task is not None:
+        payload["current_task"] = current_task
+    return cogos_emit(
+        bus_id=BUS_SESSIONS,
+        message=json.dumps(payload),
+        from_sender=session_id,
+        event_type="session.heartbeat",
+    )
+
+
+def cogos_session_end(
+    session_id: str,
+    reason: str = "user-quit",
+    handoff_id: str | None = None,
+) -> dict[str, Any]:
+    """Mark a session as closing cleanly.
+
+    Emits ``session.end`` on ``bus_sessions``. Optional but recommended — peers
+    and dashboards use this to distinguish a graceful shutdown from a crashed /
+    stalled session (which would appear inactive only after heartbeat gap).
+
+    CALL THIS WHEN the session is winding down for any reason: task complete,
+    context exhausted, user quit, or it has handed off to a successor. If a
+    handoff was offered, pass the ``handoff_id`` so viewers can link end →
+    offer → claim → complete as a chain.
+
+    Arguments:
+      session_id: this session's identifier.
+      reason:     one of ``"task-complete" | "context-exhausted" | "user-quit"
+                  | "handed-off" | "error"``. Not validated at client.
+      handoff_id: if this end is coupled to a handoff offer, the offer's id.
+                  Omit otherwise.
+
+    Contract: returns whatever ``cogos_emit`` returns.
+    """
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "ended_at": _utc_now_iso(),
+        "reason": reason,
+    }
+    if handoff_id is not None:
+        payload["handoff_id"] = handoff_id
+    return cogos_emit(
+        bus_id=BUS_SESSIONS,
+        message=json.dumps(payload),
+        from_sender=session_id,
+        event_type="session.end",
+    )
+
+
+def _parse_payload(event: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort extract a dict payload from a bus event.
+
+    The substrate stores the payload JSON-encoded in the event's ``payload``
+    field (under ``content`` when the kernel wraps it). Try both shapes; fall
+    back to an empty dict when parsing fails so aggregators stay robust against
+    malformed events rather than crashing the roster read.
+    """
+    raw = event.get("payload")
+    if isinstance(raw, dict):
+        content = raw.get("content")
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        # Already a structured payload — return as-is.
+        if raw and "content" not in raw:
+            return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def cogos_sessions_list(active_within_seconds: int = 600) -> dict[str, Any]:
+    """List sessions seen recently on ``bus_sessions``.
+
+    Reads the last 500 events on ``bus_sessions`` via ``cogos_events_read`` and
+    aggregates them into a per-session roster. For each ``session_id`` we
+    track the latest event and compute an ``active`` flag: a session counts as
+    active iff its last register/heartbeat is within ``active_within_seconds``
+    AND no ``session.end`` followed it.
+
+    CALL THIS WHEN you need a snapshot of who else is on the bus — e.g. before
+    offering a handoff to a specific session, when triaging a stuck multi-
+    session workflow, or when a dashboard wants to show currently-online
+    agents. For a live tail, poll this periodically or read the bus directly.
+
+    Arguments:
+      active_within_seconds: freshness window (default 600 = 10 min). Sessions
+                             whose last heartbeat/register is older than this
+                             are reported but flagged ``"active": False``.
+
+    Contract: returns ``{"sessions": [...], "count": N}`` on success, or the
+    underlying ``cogos_events_read`` structured error on failure.
+    """
+    read = cogos_events_read(bus_id=BUS_SESSIONS, limit=500)
+    if read.get("success") is False:
+        return read
+    events = read.get("events") or []
+
+    # Walk oldest → newest so latest wins; events_read returns in seq order.
+    by_session: dict[str, dict[str, Any]] = {}
+    for ev in events:
+        event_type = ev.get("type", "")
+        if not isinstance(event_type, str) or not event_type.startswith("session."):
+            continue
+        payload = _parse_payload(ev)
+        sid = payload.get("session_id") or ev.get("from")
+        if not isinstance(sid, str) or not sid:
+            continue
+        entry = by_session.setdefault(
+            sid,
+            {
+                "session_id": sid,
+                "status": None,
+                "role": None,
+                "task": None,
+                "workspace": None,
+                "last_seen": None,
+                "last_event_type": None,
+                "context_usage": None,
+                "_ended": False,
+            },
+        )
+        entry["last_event_type"] = event_type
+        # Prefer an explicit timestamp in the payload; fall back to the event's
+        # own timestamp field if present.
+        ts = (
+            payload.get("last_tool_use_at")
+            or payload.get("started_at")
+            or payload.get("ended_at")
+            or ev.get("ts")
+            or ev.get("time")
+        )
+        if ts:
+            entry["last_seen"] = ts
+        if event_type == "session.register":
+            entry["role"] = payload.get("role", entry["role"])
+            entry["task"] = payload.get("task", entry["task"])
+            entry["workspace"] = payload.get("workspace", entry["workspace"])
+            entry["status"] = entry["status"] or "active"
+            entry["_ended"] = False
+        elif event_type == "session.heartbeat":
+            entry["status"] = payload.get("status", entry["status"])
+            if "context_usage" in payload:
+                entry["context_usage"] = payload["context_usage"]
+            if "current_task" in payload:
+                entry["task"] = payload["current_task"]
+        elif event_type == "session.end":
+            entry["status"] = "ended"
+            entry["_ended"] = True
+
+    # Compute active within the freshness window.
+    now = datetime.now(timezone.utc)
+    out: list[dict[str, Any]] = []
+    for entry in by_session.values():
+        active = not entry["_ended"]
+        last_seen = entry.get("last_seen")
+        if active and isinstance(last_seen, str):
+            try:
+                parsed = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                active = (now - parsed).total_seconds() <= active_within_seconds
+            except ValueError:
+                # Unparseable timestamp — be conservative and include the row
+                # but flag it as inactive.
+                active = False
+        elif active and last_seen is None:
+            active = False
+        entry["active"] = active
+        entry.pop("_ended", None)
+        out.append(entry)
+
+    return {"sessions": out, "count": len(out)}
+
+
+def cogos_handoff_offer(
+    from_session: str,
+    task: dict[str, Any],
+    bootstrap_prompt: str,
+    to_session: str | None = None,
+    reason: str = "explicit",
+    ttl_seconds: int = 3600,
+    bus_context_refs: list[dict[str, Any]] | None = None,
+    memory_refs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Publish a handoff offer onto ``bus_handoffs``.
+
+    Writes a ``handoff.offer`` event whose payload matches
+    docs/HANDOFF_PROTOCOL.md §handoff.offer exactly. The tool generates a new
+    ``handoff_id``, stamps ``created_at``, and delegates the actual wire send
+    to ``cogos_emit``.
+
+    CALL THIS WHEN this session wants to hand its task off to a fresh-context
+    successor — either because context is near exhausted, the task is pausing,
+    or decomposing into a worker. Write the ``bootstrap_prompt`` as a brief for
+    a smart colleague walking in cold: critical invariants, what's been done,
+    what to do next, verification gates. The successor reads it verbatim as
+    their first turn. Set ``to_session=None`` for an open offer (any fresh
+    session can claim); set it to a specific session_id for a targeted handoff.
+
+    Arguments:
+      from_session:     this session's identifier.
+      task:             dict per the protocol: required keys ``title``,
+                        ``goal``, and a non-empty ``next_steps`` list. Optional
+                        keys (may be empty lists / strings): ``progress_summary``,
+                        ``files_touched``, ``files_pending``, ``decisions_made``,
+                        ``open_questions``, ``verification_gates``.
+      bootstrap_prompt: the load-bearing field — the text given to the
+                        successor as its first user turn.
+      to_session:       target session_id, or None for an open offer.
+      reason:           short label for why the handoff (e.g. ``"explicit"``,
+                        ``"context-exhaustion"``, ``"decomposition"``).
+      ttl_seconds:      offer expiry window; after this the offer is stale and
+                        should not be claimed.
+      bus_context_refs: list of ``{"bus_id", "after_seq"}`` pointing at
+                        conversational buses the successor should read for
+                        context. Optional.
+      memory_refs:      list of ``cog://`` URIs pointing at CogDocs / memory
+                        entries with state too large to inline. Optional.
+
+    Contract: returns ``{"handoff_id": "...", "emit_result": <kernel response
+    or error dict>}``. Validation errors surface as ``{"success": False,
+    "error": ...}`` without contacting the kernel.
+    """
+    # Minimal validation per the spec — title, goal, and next_steps must be
+    # non-empty. Everything else is passed through verbatim.
+    if not isinstance(task, dict):
+        return {
+            "success": False,
+            "error": f"task must be a dict, got {type(task).__name__}",
+        }
+    title = task.get("title")
+    goal = task.get("goal")
+    next_steps = task.get("next_steps")
+    if not isinstance(title, str) or not title.strip():
+        return {"success": False, "error": "task.title must be a non-empty string"}
+    if not isinstance(goal, str) or not goal.strip():
+        return {"success": False, "error": "task.goal must be a non-empty string"}
+    if not isinstance(next_steps, list) or not next_steps:
+        return {"success": False, "error": "task.next_steps must be a non-empty list"}
+
+    handoff_id = _new_handoff_id()
+    payload: dict[str, Any] = {
+        "handoff_id": handoff_id,
+        "from_session": from_session,
+        "to_session": to_session,
+        "reason": reason,
+        "created_at": _utc_now_iso(),
+        "ttl_seconds": ttl_seconds,
+        "task": task,
+        "bootstrap_prompt": bootstrap_prompt,
+        "bus_context_refs": list(bus_context_refs) if bus_context_refs else [],
+        "memory_refs": list(memory_refs) if memory_refs else [],
+    }
+    emit_result = cogos_emit(
+        bus_id=BUS_HANDOFFS,
+        message=json.dumps(payload),
+        from_sender=from_session,
+        event_type="handoff.offer",
+    )
+    return {"handoff_id": handoff_id, "emit_result": emit_result}
+
+
+def _aggregate_handoffs(
+    events: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Group bus_handoffs events by handoff_id and compute current state.
+
+    State machine: ``open`` → ``claimed`` → ``complete``. The latest event wins
+    (events are seq-ordered by the kernel). Unknown event types are ignored.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    for ev in events:
+        event_type = ev.get("type", "")
+        if not isinstance(event_type, str) or not event_type.startswith("handoff."):
+            continue
+        payload = _parse_payload(ev)
+        hid = payload.get("handoff_id")
+        if not isinstance(hid, str) or not hid:
+            continue
+        entry = by_id.setdefault(
+            hid,
+            {
+                "handoff_id": hid,
+                "state": None,
+                "offer_payload": None,
+                "claim_payload": None,
+                "complete_payload": None,
+                "from_session": None,
+                "to_session": None,
+                "reason": None,
+                "created_at": None,
+                "ttl_seconds": None,
+                "task_title": None,
+            },
+        )
+        if event_type == "handoff.offer":
+            entry["state"] = "open"
+            entry["offer_payload"] = payload
+            entry["from_session"] = payload.get("from_session")
+            entry["to_session"] = payload.get("to_session")
+            entry["reason"] = payload.get("reason")
+            entry["created_at"] = payload.get("created_at")
+            entry["ttl_seconds"] = payload.get("ttl_seconds")
+            task = payload.get("task")
+            if isinstance(task, dict):
+                entry["task_title"] = task.get("title")
+        elif event_type == "handoff.claim":
+            entry["state"] = "claimed"
+            entry["claim_payload"] = payload
+        elif event_type == "handoff.complete":
+            entry["state"] = "complete"
+            entry["complete_payload"] = payload
+    return by_id
+
+
+def cogos_handoff_list_open(
+    for_session: str | None = None,
+    include_claimed: bool = False,
+) -> dict[str, Any]:
+    """List handoff offers that are currently available to claim.
+
+    Reads ``bus_handoffs`` (up to 500 events) and groups by ``handoff_id`` to
+    derive state. By default returns offers in state ``open`` (no claim yet).
+    Set ``include_claimed=True`` to also see handoffs that have been claimed
+    but not yet completed — useful for observing in-flight work.
+
+    CALL THIS WHEN a fresh session is starting and wants to know if there's
+    inherited work to pick up, when a manager wants a roster of pending
+    handoffs, or when triaging why a handoff chain has stalled.
+
+    Arguments:
+      for_session:     if set, only include offers whose ``to_session``
+                       matches this id OR whose ``to_session`` is null (open).
+                       Leave None to see every open offer.
+      include_claimed: include claimed-but-not-complete handoffs alongside
+                       open offers (default False — open only).
+
+    Contract: returns ``{"handoffs": [...], "count": N}``. Each entry has
+    ``{handoff_id, from_session, to_session, reason, created_at, ttl_seconds,
+    state, task_title}``. Structured error from ``cogos_events_read`` on
+    failure.
+    """
+    read = cogos_events_read(bus_id=BUS_HANDOFFS, limit=500)
+    if read.get("success") is False:
+        return read
+    events = read.get("events") or []
+    grouped = _aggregate_handoffs(events)
+
+    wanted_states = {"open"}
+    if include_claimed:
+        wanted_states.add("claimed")
+
+    out: list[dict[str, Any]] = []
+    for hid, entry in grouped.items():
+        if entry["state"] not in wanted_states:
+            continue
+        if for_session is not None:
+            to_sess = entry.get("to_session")
+            if to_sess is not None and to_sess != for_session:
+                continue
+        out.append(
+            {
+                "handoff_id": hid,
+                "from_session": entry.get("from_session"),
+                "to_session": entry.get("to_session"),
+                "reason": entry.get("reason"),
+                "created_at": entry.get("created_at"),
+                "ttl_seconds": entry.get("ttl_seconds"),
+                "state": entry.get("state"),
+                "task_title": entry.get("task_title"),
+            }
+        )
+
+    return {"handoffs": out, "count": len(out)}
+
+
+def cogos_handoff_claim(handoff_id: str, claiming_session: str) -> dict[str, Any]:
+    """Claim an open handoff offer and retrieve its full payload.
+
+    Emits a ``handoff.claim`` event on ``bus_handoffs`` then returns the
+    corresponding offer's full payload (fetched via ``cogos_events_read``) so
+    the claiming session can immediately read ``bootstrap_prompt``, ``task``,
+    ``bus_context_refs``, and ``memory_refs`` without an extra round-trip.
+
+    Claim is first-wins-by-seq: the lowest-seq claim for a given
+    ``handoff_id`` is the valid claimant. Other would-be claimants should
+    detect the earlier claim via ``cogos_handoff_list_open(include_claimed=
+    True)`` before starting work.
+
+    CALL THIS WHEN a fresh session is picking up a handoff identified via
+    ``cogos_handoff_list_open``. Emit ``cogos_session_register`` for yourself
+    first so you're visible on the roster, THEN claim.
+
+    Arguments:
+      handoff_id:       the offer's id.
+      claiming_session: this session's identifier (must be registered).
+
+    Contract: on success returns ``{"handoff_id", "claim_emitted": <emit
+    result>, "offer": <full offer payload>}``. If the offer cannot be found in
+    the bus, returns ``{"success": False, "error": "...", "handoff_id":
+    ...}`` WITHOUT emitting the claim (avoid polluting the bus with claims
+    against phantom offers).
+    """
+    read = cogos_events_read(bus_id=BUS_HANDOFFS, limit=500)
+    if read.get("success") is False:
+        return {
+            "success": False,
+            "error": f"could not read bus_handoffs: {read.get('error')}",
+            "handoff_id": handoff_id,
+        }
+    events = read.get("events") or []
+    offer_payload: dict[str, Any] | None = None
+    for ev in events:
+        if ev.get("type") != "handoff.offer":
+            continue
+        payload = _parse_payload(ev)
+        if payload.get("handoff_id") == handoff_id:
+            offer_payload = payload
+            break
+    if offer_payload is None:
+        return {
+            "success": False,
+            "error": f"no handoff.offer found for handoff_id={handoff_id}",
+            "handoff_id": handoff_id,
+        }
+
+    claim_payload = {
+        "handoff_id": handoff_id,
+        "claiming_session": claiming_session,
+        "previous_session": offer_payload.get("from_session"),
+        "claimed_at": _utc_now_iso(),
+    }
+    claim_emitted = cogos_emit(
+        bus_id=BUS_HANDOFFS,
+        message=json.dumps(claim_payload),
+        from_sender=claiming_session,
+        event_type="handoff.claim",
+    )
+    return {
+        "handoff_id": handoff_id,
+        "claim_emitted": claim_emitted,
+        "offer": offer_payload,
+    }
+
+
+def cogos_handoff_complete(
+    handoff_id: str,
+    completing_session: str,
+    outcome: str = "done",
+    notes: str | None = None,
+    next_handoff_id: str | None = None,
+) -> dict[str, Any]:
+    """Mark a handoff as finished.
+
+    Emits ``handoff.complete`` on ``bus_handoffs``. Closes the offer → claim
+    → complete chain. If the work has been re-offered to yet another session,
+    pass ``outcome="reoffered"`` and ``next_handoff_id`` to link the chain.
+
+    CALL THIS WHEN the session that claimed the handoff has finished the work
+    (``outcome="done"``), decided the task cannot be completed
+    (``"abandoned"``), or itself handed off (``"reoffered"``).
+
+    Arguments:
+      handoff_id:         the handoff this completes.
+      completing_session: the session emitting completion (should be the
+                          claimant, but not enforced).
+      outcome:            one of ``"done" | "reoffered" | "abandoned"``.
+      notes:              short free-form summary for observers. Optional.
+      next_handoff_id:    when ``outcome="reoffered"``, the new offer's id.
+
+    Contract: returns whatever ``cogos_emit`` returns.
+    """
+    payload: dict[str, Any] = {
+        "handoff_id": handoff_id,
+        "completing_session": completing_session,
+        "outcome": outcome,
+        "completed_at": _utc_now_iso(),
+    }
+    if notes is not None:
+        payload["notes"] = notes
+    if next_handoff_id is not None:
+        payload["next_handoff_id"] = next_handoff_id
+    return cogos_emit(
+        bus_id=BUS_HANDOFFS,
+        message=json.dumps(payload),
+        from_sender=completing_session,
+        event_type="handoff.complete",
+    )
+
+
 def register(mcp: FastMCP) -> None:
     """Register bridge tools with the MCP server.
 
@@ -392,3 +1021,51 @@ def register(mcp: FastMCP) -> None:
             readOnlyHint=True, idempotentHint=True, openWorldHint=True
         ),
     )(cogos_resolve)
+    mcp.tool(
+        title="Register Cog OS session presence",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_session_register)
+    mcp.tool(
+        title="Emit Cog OS session heartbeat",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_session_heartbeat)
+    mcp.tool(
+        title="End Cog OS session",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_session_end)
+    mcp.tool(
+        title="List active Cog OS sessions",
+        annotations=ToolAnnotations(
+            readOnlyHint=True, idempotentHint=True, openWorldHint=True
+        ),
+    )(cogos_sessions_list)
+    mcp.tool(
+        title="Offer Cog OS handoff",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_handoff_offer)
+    mcp.tool(
+        title="List open Cog OS handoffs",
+        annotations=ToolAnnotations(
+            readOnlyHint=True, idempotentHint=True, openWorldHint=True
+        ),
+    )(cogos_handoff_list_open)
+    mcp.tool(
+        title="Claim Cog OS handoff",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_handoff_claim)
+    mcp.tool(
+        title="Complete Cog OS handoff",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_handoff_complete)
