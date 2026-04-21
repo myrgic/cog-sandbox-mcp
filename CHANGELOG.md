@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.1 — 2026-04-21
+
+Eight new bridge tools composing over the kernel's `/v1/bus/*` endpoints to deliver the session-identity + handoff substrate. Tool count goes 4 → 12. Protocol spec lands in `docs/HANDOFF_PROTOCOL.md`.
+
+**New tools (sessions):**
+- `cogos_session_register(session_id, workspace, role, task, model=None, hostname=None)` — announces a session's presence on `bus_sessions`. Uses the `<hostname>-<workspace-slug>-<session-slug>` identity format from the spec.
+- `cogos_session_heartbeat(session_id, status="active", context_usage=None, current_task=None)` — periodic keep-alive. Roster queries infer liveness from presence of a recent heartbeat.
+- `cogos_session_end(session_id, reason="user-quit", handoff_id=None)` — graceful shutdown marker. Optional `handoff_id` links the chain when a session ends via handoff rather than quit.
+- `cogos_sessions_list(active_within_seconds=600)` — aggregated roster from the last 500 events on `bus_sessions`; flags each entry's `active` status based on freshness.
+
+**New tools (handoffs):**
+- `cogos_handoff_offer(from_session, task, bootstrap_prompt, to_session=None, reason="explicit", ttl_seconds=3600, bus_context_refs=None, memory_refs=None)` — publishes a handoff offer to `bus_handoffs`. The `bootstrap_prompt` is the load-bearing field — given to the successor as its first user turn.
+- `cogos_handoff_list_open(for_session=None, include_claimed=False)` — lists open handoffs, optionally filtered to ones targeting a specific session (plus open-to-anyone).
+- `cogos_handoff_claim(handoff_id, claiming_session)` — atomic claim; first-wins-by-seq. Returns the full offer payload so the claiming session has `bootstrap_prompt`/`task`/`memory_refs` without a second round-trip.
+- `cogos_handoff_complete(handoff_id, completing_session, outcome="done", notes=None, next_handoff_id=None)` — marks a handoff as finished. `outcome="reoffered"` + `next_handoff_id` links recursive relays.
+
+**Spec:** `docs/HANDOFF_PROTOCOL.md` defines session identity format, well-known bus names (`bus_sessions` / `bus_handoffs` / `bus_broadcast`), lifecycle event shapes, claim semantics, and the sovereignty framing (CogOS domain vs host-OS domain).
+
+All tools inherit the never-raise contract — structured `{"success": False, "error": ..., ...}` on failure. Tests: 23 payload-shape tests in `tests/test_session_handoff.py`, mock-based, no live kernel required.
+
+## 0.4.0 — 2026-04-21
+
+HTTP streamable transport for multi-client substrate coordination. Transport selection gated on `MCP_TRANSPORT` env var — `stdio` remains default; set `MCP_TRANSPORT=http` to enable HTTP. Host/port/path configurable via `MCP_HTTP_HOST` / `MCP_HTTP_PORT` / `MCP_HTTP_PATH`.
+
+**Why:** stdio transport constrains cog-sandbox-mcp to one client per process. Multi-session MCP substrate coordination — multiple Claude Code sessions sharing one centralized bridge as peers — requires HTTP. This is the foundation for the 0.4.1 session/handoff layer landing alongside it.
+
+**Tests:** 11 new tests in `tests/test_transport.py` cover transport selection end-to-end without socket binding (asserts `run()` dispatches to the correct transport handler given env var state).
+
+**No breaking changes** to the v0.3.x tool surface. All previously-passing tests continue to pass.
+
 ## 0.3.4 — 2026-04-20
 
 Fourth bridge tool: `cogos_resolve`. Read-only access to `cog://` URIs — ADRs, memory entries, any kernel-addressed resource. Handles the kernel's base64-over-JSON wire encoding with a decode contract that gracefully falls through on binary / malformed content.
