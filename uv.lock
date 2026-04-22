@@ -139,7 +139,7 @@ wheels = [
 
 [[package]]
 name = "cog-sandbox-mcp"
-version = "0.3.4"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },

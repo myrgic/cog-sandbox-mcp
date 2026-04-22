@@ -91,7 +91,7 @@ def find_duplicates(
         {
             "hash": h,
             "size": paths[0].stat().st_size,
-            "paths": [to_virtual(p) for p in paths],
+            "paths": sorted(to_virtual(p) for p in paths),
         }
         for h, paths in by_hash.items()
         if len(paths) > 1
@@ -116,6 +116,7 @@ def consolidate_duplicates(
 
     strategy: 'hardlink' replaces dupes with hardlinks; 'delete' removes them.
     keep: 'oldest' | 'newest' | 'first' — which file to retain per group.
+    'first' means the lexicographically-first virtual path (deterministic).
     Hardlinking is done atomically via a temp path + rename.
     """
     _expire_old_plans()

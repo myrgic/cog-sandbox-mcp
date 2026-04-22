@@ -1,6 +1,13 @@
 # Handoff Protocol
 
-Spec for session identity, presence, and handoff events over the CogOS bus. Implemented by the `cogos_session_*` and `cogos_handoff_*` tool families in `cog-sandbox-mcp`.
+_Version 0.2 — kernel-native hybrid (2026-04-22)._
+
+Spec for session identity, presence, and handoff events over the CogOS bus. Implemented in two complementary MCP surfaces (see §Implementation: two MCP surfaces):
+
+- `cogos_session_*` / `cogos_handoff_*` tools in `cog-sandbox-mcp` (Python, the current MCP config) — thin shims over the kernel routes below.
+- `cog_register_session` / `cog_offer_handoff` / etc. native kernel tools served directly at the kernel's `/mcp` endpoint (Go, for future native clients).
+
+Both surfaces read and write the same kernel-native session & handoff registries; the bus (`bus_sessions` and `bus_handoffs`) is still the append-only ground truth.
 
 ## Sovereignty context
 
@@ -244,25 +251,72 @@ User opens fresh Claude Code session (Session B)
 
 ## Tool mapping
 
-These tools (to be added in Wave 1) implement the protocol:
+Each protocol operation is served by a pair of MCP tools — the Python bridge tool (ergonomic shim, current MCP config) and the kernel-native tool (no Python dependency, future native clients). Both hit the same kernel registries.
 
-| Tool | Event emitted / read | Notes |
-|------|----------------------|-------|
-| `cogos_session_register(session_id, workspace, role, task)` | writes `session.register` | Idempotent; re-registering updates status |
-| `cogos_session_heartbeat(session_id, status, context_usage, current_task)` | writes `session.heartbeat` | Call every ~5 min |
-| `cogos_sessions_list(active_within_seconds)` | reads `bus_sessions` + aggregates | Returns active session roster |
-| `cogos_handoff_offer(task, bootstrap_prompt, refs, ...)` | writes `handoff.offer` | Returns `handoff_id` |
-| `cogos_handoff_list_open(for_session)` | reads `bus_handoffs` + filters | Returns offers without claims |
-| `cogos_handoff_claim(handoff_id, claiming_session)` | writes `handoff.claim`, returns offer | First-wins |
-| `cogos_handoff_complete(handoff_id, outcome, notes)` | writes `handoff.complete` | |
+| Bridge tool (`cogos_*`) | Kernel tool (`cog_*`) | HTTP route | Event emitted |
+|---|---|---|---|
+| `cogos_session_register(session_id, workspace, role, task)` | `cog_register_session` | `POST /v1/sessions/register` | `session.register` |
+| `cogos_session_heartbeat(session_id, status, context_usage, current_task)` | `cog_heartbeat_session` | `POST /v1/sessions/{id}/heartbeat` | `session.heartbeat` |
+| `cogos_session_end(session_id, reason, handoff_id?)` | `cog_end_session` | `POST /v1/sessions/{id}/end` | `session.end` |
+| `cogos_sessions_list(active_within_seconds, include_ended?)` | `cog_list_sessions` | `GET /v1/sessions/presence` | — (read) |
+| `cogos_handoff_offer(from_session, task, bootstrap_prompt, ...)` | `cog_offer_handoff` | `POST /v1/handoffs/offer` | `handoff.offer` |
+| `cogos_handoff_list_open(for_session, include_claimed?)` | `cog_list_handoffs` | `GET /v1/handoffs` | — (read) |
+| `cogos_handoff_claim(handoff_id, claiming_session)` | `cog_claim_handoff` | `POST /v1/handoffs/{id}/claim` | `handoff.claim` or `handoff.claim_rejected` |
+| `cogos_handoff_complete(handoff_id, outcome, notes)` | `cog_complete_handoff` | `POST /v1/handoffs/{id}/complete` | `handoff.complete` |
 
-All tools thread `session_id` through as the `from_sender` of the underlying `cogos_emit` call, so every substrate action is attributable.
+All tools thread `session_id` through as the `from` field on every bus event, so every substrate action is attributable.
+
+## Implementation: two MCP surfaces
+
+v0.2 moved invariance enforcement from the Python bridge to the kernel. There are now **two MCP surfaces** that consumers can use interchangeably:
+
+1. **Python bridge (`cogos_*`)** — served by `cog-sandbox-mcp` on its configured MCP transport. Current MCP config uses these. They keep the never-raise contract (`{"success": False, "error": ..., "bus_id": ...}` on any HTTP failure) and provide ergonomic payload composition, JSON-wrapping, etc. Internally they call the kernel routes above.
+2. **Kernel-native (`cog_*`)** — served by the kernel's own `/mcp` endpoint. No Python dependency. Uses the kernel's own MCP handler pattern, same `cog_*` prefix convention as the rest of the kernel's tools.
+
+Both surfaces share the **same kernel truth**: a single in-memory session registry and handoff registry, each guarded by a mutex and backed by the bus as authoritative ground truth. A `cogos_*` call from the bridge and a `cog_*` call from a native client compete on the same lock and honor the same first-wins semantics. The duplication is in presentation (how the agent invokes it), not in state.
+
+**When to use which:**
+
+- Use `cogos_*` if the agent is already configured against the Python bridge. It's the default for Claude Code today.
+- Use `cog_*` if a client wants to skip the Python hop (e.g. a future native desktop app, Wave widget, or direct `cog` CLI invocation).
+
+Both are fully supported; neither is "the future" and the other "legacy." The bus is the portable layer; the MCP tool names are just two doorways to it.
+
+## Atomic claim (closed in v0.2)
+
+The v0.1 bridge did a read-then-emit dance: read `bus_handoffs` to find the offer, then emit a `handoff.claim`. This was racy — two claimants could read the bus simultaneously, see the offer un-claimed, and each emit. The seq ordering in the bus guaranteed a canonical winner, but losers had to detect their loss out-of-band by re-reading the bus. Nothing prevented them from starting work first.
+
+v0.2 encloses the check-and-emit under a kernel mutex (`HandoffRegistry`). The kernel's `ApplyClaim` atomically:
+
+1. Confirms the offer exists (else `404`).
+2. Confirms no other claim has landed (else `409 already_claimed`).
+3. Confirms TTL hasn't expired (else `409 ttl_expired`).
+4. Transitions the in-memory row to `claimed` and records the winner.
+5. Emits the `handoff.claim` event to `bus_handoffs`.
+
+Concurrent claim attempts produce exactly one `200` response and N-1 `409`s. No wasted work.
+
+### `handoff.claim_rejected` event
+
+Every rejected claim also emits a `handoff.claim_rejected` event to `bus_handoffs` for audit (added in v0.2). Payload:
+
+```json
+{
+  "handoff_id": "ho-1732136400000-abc123def456",
+  "attempting_session": "slowbro-laptop-loser-session",
+  "reason": "already_claimed",
+  "rejected_at": "2026-04-22T12:00:00.123456Z",
+  "conflicting_session": "slowbro-laptop-winner-session"
+}
+```
+
+`reason` is one of `already_claimed | ttl_expired | offer_not_found | out_of_order`. `conflicting_session` is set when `reason == already_claimed`. Observers filtering by `type: handoff.claim_rejected` can see every racy-claim attempt — useful for diagnosing why a handoff didn't land where expected.
 
 ## Non-goals for v1
 
-- **No central coordinator.** All state lives in the bus; no daemon tracks it. Consistent with the distributed-by-design principle.
-- **No strong claim enforcement.** First-wins-by-seq is advisory; a misbehaving client could double-claim. For v1 we trust the participants. (A future version may require role-based auth for `handoff.claim` against a `workspace-owner` or `node-admin` role.)
-- **No bus federation.** The schema is cross-node-ready but v0.1 operates on a single node's bus. Federation (laptop bus ↔ desktop bus sharing `bus_handoffs`) is deferred — it's a bus-layer concern, not a protocol-layer concern.
+- **No central coordinator outside the local kernel.** All cross-node state still lives in the federatable bus; the per-kernel in-memory registries are derived views rebuilt from bus replay on restart. ~~No daemon tracks it.~~ Updated v0.2: the local kernel tracks it, but only as a cache — the bus remains authoritative. The distributed-by-design principle is unchanged for multi-node scenarios; single-node invariants are now enforced server-side.
+- ~~**No strong claim enforcement.**~~ **Closed in v0.2 for single-node.** Atomic claim is now enforced by the kernel's `HandoffRegistry` mutex. Cross-node claim races still depend on bus-seq ordering until BEP sync ships, so the v0.1 advisory wording still applies to that case. A future version may add role-based auth for `handoff.claim` against a `workspace-owner` or `node-admin` role.
+- **No bus federation.** The schema is cross-node-ready but v0.1/v0.2 operate on a single node's bus. Federation (laptop bus ↔ desktop bus sharing `bus_handoffs`) is deferred — it's a bus-layer concern, not a protocol-layer concern.
 - **No cross-node handoff auth.** Handoffs within a node rely on the host OS + workspace trust model. Cross-node handoff will require cryptographic workspace identity; that layer is not yet built.
 - **No automatic handoff triggering.** Sessions decide when to offer; no kernel-side "context is 90% full, auto-handoff" logic yet.
 - **No memory sync.** Sessions are responsible for writing state to CogDocs themselves via `cog memory write` and referencing in `memory_refs`. CogDoc replication across nodes is a future CogOS-layer concern, not a handoff-protocol one.
@@ -271,4 +325,16 @@ All tools thread `session_id` through as the `from_sender` of the underlying `co
 
 ## Versioning
 
-This protocol is v0.1. Breaking changes require a new `protocol_version` field in event payloads. For now, absence of the field implies v0.1.
+### v0.2 (2026-04-22) — current
+
+- Kernel-native hybrid landed. Session & handoff registries now live in the kernel (`internal/engine/sessions.go`, `serve_sessions_mgmt.go`).
+- Atomic claim enforced server-side (`409 already_claimed` / `409 ttl_expired` / `404 offer_not_found`).
+- `handoff.claim_rejected` event added for observability.
+- Two MCP surfaces coexist (`cogos_*` bridge tools + `cog_*` kernel-native tools); same kernel truth, two doorways.
+- Bridge tools refactored to shim over kernel routes — MCP signatures unchanged; no breaking change to clients.
+
+### v0.1 (prior)
+
+Bridge-only implementation: all eight tools composed over `POST /v1/bus/send` and `GET /v1/bus/{bus_id}/events`. Session-lifecycle invariants enforced by convention, not by the kernel. Claim was racy.
+
+Breaking changes require a new `protocol_version` field in event payloads. For now, absence of the field implies v0.1/v0.2 (wire-compatible).
