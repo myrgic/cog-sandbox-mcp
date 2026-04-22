@@ -388,6 +388,70 @@ def cogos_resolve(uri: str, decode: bool = True) -> dict[str, Any]:
     return result
 
 
+def _kernel_post(
+    path: str,
+    payload: dict[str, Any],
+    bus_id: str,
+) -> dict[str, Any]:
+    """POST payload to a kernel route and wrap errors with the bridge's
+    never-raise contract. Success: returns the kernel body verbatim. Failure:
+    returns ``{"success": False, "error": ..., "bus_id": bus_id}`` without
+    raising.
+    """
+    try:
+        return _http_post_json(path, payload)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        detail = f"HTTP {e.code} {e.reason}"
+        if body:
+            detail = f"{detail} — {body}"
+        return {"success": False, "error": detail, "bus_id": bus_id}
+    except urllib.error.URLError as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "bus_id": bus_id,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "bus_id": bus_id,
+        }
+
+
+def _kernel_get(path: str, params: dict[str, Any] | None, bus_id: str) -> Any:
+    """GET a kernel route, wrapping errors in the never-raise contract."""
+    try:
+        return _http_get_any_with_params(path, params)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        detail = f"HTTP {e.code} {e.reason}"
+        if body:
+            detail = f"{detail} — {body}"
+        return {"success": False, "error": detail, "bus_id": bus_id}
+    except urllib.error.URLError as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "bus_id": bus_id,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "bus_id": bus_id,
+        }
+
+
 def cogos_session_register(
     session_id: str,
     workspace: str,
@@ -396,13 +460,14 @@ def cogos_session_register(
     model: str | None = None,
     hostname: str | None = None,
 ) -> dict[str, Any]:
-    """Announce a session's presence on the shared ``bus_sessions`` channel.
+    """Announce a session's presence on the kernel-native session registry.
 
-    Emits a ``session.register`` event with a JSON payload per
-    docs/HANDOFF_PROTOCOL.md §Session lifecycle. Delegates to ``cogos_emit`` so
-    the never-raise contract (structured ``{"success": False, ...}`` on failure)
-    is inherited automatically. The event's ``from`` field is set to
-    ``session_id`` so all downstream emissions are attributable to this session.
+    As of HANDOFF_PROTOCOL v0.2 this calls the kernel's ``POST
+    /v1/sessions/register`` route. The kernel validates ``session_id`` format,
+    updates its in-memory registry, and mirrors the event to ``bus_sessions``
+    (the bus is still ground truth). The wire payload the kernel writes is
+    byte-compat with v0.1 bridge-direct emissions — downstream tooling that
+    reads ``bus_sessions`` directly does not need updating.
 
     CALL THIS WHEN a new agent session comes online and wants to participate in
     the cross-session substrate — e.g. at the top of a Claude Code session that
@@ -414,8 +479,8 @@ def cogos_session_register(
 
     Arguments:
       session_id: stable identifier for this session (ASCII, lowercase,
-                  ``[a-z0-9-]``). Used as ``from`` on every emit from this
-                  session.
+                  ``[a-z0-9-]``, at least two hyphen-separated components).
+                  Used as ``from`` on every emit from this session.
       workspace:  absolute path to the working directory / repo root this
                   session is operating in.
       role:       human-meaningful role label ("manager", "worker-1",
@@ -426,27 +491,22 @@ def cogos_session_register(
       hostname:   optional hostname; recommended when multiple machines
                   participate in the same bus.
 
-    Contract: returns whatever ``cogos_emit`` returns — the kernel's response
-    verbatim on success, or a ``{"success": False, "error": ..., "bus_id":
-    "bus_sessions"}`` payload on failure.
+    Contract: returns the kernel's JSON body on success (includes ``ok``,
+    ``seq``, ``hash``, ``created``, and the canonical ``session`` row). On
+    HTTP 4xx/5xx or transport failure, returns ``{"success": False, "error":
+    ..., "bus_id": "bus_sessions"}`` — same never-raise contract as before.
     """
     payload: dict[str, Any] = {
         "session_id": session_id,
         "workspace": workspace,
         "role": role,
         "task": task,
-        "started_at": _utc_now_iso(),
     }
     if model is not None:
         payload["model"] = model
     if hostname is not None:
         payload["hostname"] = hostname
-    return cogos_emit(
-        bus_id=BUS_SESSIONS,
-        message=json.dumps(payload),
-        from_sender=session_id,
-        event_type="session.register",
-    )
+    return _kernel_post("/v1/sessions/register", payload, BUS_SESSIONS)
 
 
 def cogos_session_heartbeat(
@@ -455,12 +515,14 @@ def cogos_session_heartbeat(
     context_usage: float | None = None,
     current_task: str | None = None,
 ) -> dict[str, Any]:
-    """Emit a periodic keep-alive for the session's presence.
+    """Emit a periodic keep-alive heartbeat to the kernel session registry.
 
-    Emits ``session.heartbeat`` on ``bus_sessions`` per HANDOFF_PROTOCOL.md.
-    Downstream roster queries (``cogos_sessions_list``) infer liveness from the
-    presence of a recent heartbeat. Sessions typically heartbeat every ~5
-    minutes; absence of a heartbeat for 2× interval marks the session inactive.
+    As of HANDOFF_PROTOCOL v0.2 this calls ``POST
+    /v1/sessions/{id}/heartbeat``. The kernel rejects heartbeats for
+    unregistered sessions (404) and for already-ended sessions (409), and
+    updates LastSeen + optional status/context fields before mirroring the
+    event to ``bus_sessions``. Downstream roster queries use the kernel's
+    in-memory registry (warm cache of the bus) for presence answers.
 
     CALL THIS WHEN the agent wants to signal "still alive / working" so peers
     and dashboards see the session as active, or to publish a status transition
@@ -477,23 +539,17 @@ def cogos_session_heartbeat(
       current_task:   short string describing what the session is doing right
                       now. Optional.
 
-    Contract: returns whatever ``cogos_emit`` returns. Structured error on
-    failure; does not raise.
+    Contract: on success returns the kernel's JSON body (``ok``, ``seq``,
+    ``hash``, updated ``session`` row). On failure returns
+    ``{"success": False, "error": ..., "bus_id": "bus_sessions"}``.
     """
-    payload: dict[str, Any] = {
-        "session_id": session_id,
-        "status": status,
-        "last_tool_use_at": _utc_now_iso(),
-    }
+    payload: dict[str, Any] = {"status": status}
     if context_usage is not None:
         payload["context_usage"] = context_usage
     if current_task is not None:
         payload["current_task"] = current_task
-    return cogos_emit(
-        bus_id=BUS_SESSIONS,
-        message=json.dumps(payload),
-        from_sender=session_id,
-        event_type="session.heartbeat",
+    return _kernel_post(
+        f"/v1/sessions/{session_id}/heartbeat", payload, BUS_SESSIONS
     )
 
 
@@ -502,11 +558,14 @@ def cogos_session_end(
     reason: str = "user-quit",
     handoff_id: str | None = None,
 ) -> dict[str, Any]:
-    """Mark a session as closing cleanly.
+    """Mark a session as ending cleanly on the kernel registry.
 
-    Emits ``session.end`` on ``bus_sessions``. Optional but recommended — peers
-    and dashboards use this to distinguish a graceful shutdown from a crashed /
-    stalled session (which would appear inactive only after heartbeat gap).
+    As of HANDOFF_PROTOCOL v0.2 this calls ``POST /v1/sessions/{id}/end``.
+    The kernel rejects ends for unknown sessions (404) and already-ended
+    sessions (409), then mirrors the event to ``bus_sessions``. Optional but
+    recommended — peers and dashboards use this to distinguish a graceful
+    shutdown from a crashed / stalled session (which would only appear
+    inactive after heartbeat gap).
 
     CALL THIS WHEN the session is winding down for any reason: task complete,
     context exhausted, user quit, or it has handed off to a successor. If a
@@ -520,20 +579,14 @@ def cogos_session_end(
       handoff_id: if this end is coupled to a handoff offer, the offer's id.
                   Omit otherwise.
 
-    Contract: returns whatever ``cogos_emit`` returns.
+    Contract: kernel JSON body on success, structured ``{"success": False,
+    "error": ..., "bus_id": "bus_sessions"}`` on failure.
     """
-    payload: dict[str, Any] = {
-        "session_id": session_id,
-        "ended_at": _utc_now_iso(),
-        "reason": reason,
-    }
+    payload: dict[str, Any] = {"reason": reason}
     if handoff_id is not None:
         payload["handoff_id"] = handoff_id
-    return cogos_emit(
-        bus_id=BUS_SESSIONS,
-        message=json.dumps(payload),
-        from_sender=session_id,
-        event_type="session.end",
+    return _kernel_post(
+        f"/v1/sessions/{session_id}/end", payload, BUS_SESSIONS
     )
 
 
@@ -568,108 +621,48 @@ def _parse_payload(event: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def cogos_sessions_list(active_within_seconds: int = 600) -> dict[str, Any]:
-    """List sessions seen recently on ``bus_sessions``.
+def cogos_sessions_list(
+    active_within_seconds: int = 600,
+    include_ended: bool = False,
+) -> dict[str, Any]:
+    """List sessions tracked by the kernel registry.
 
-    Reads the last 500 events on ``bus_sessions`` via ``cogos_events_read`` and
-    aggregates them into a per-session roster. For each ``session_id`` we
-    track the latest event and compute an ``active`` flag: a session counts as
-    active iff its last register/heartbeat is within ``active_within_seconds``
-    AND no ``session.end`` followed it.
+    As of HANDOFF_PROTOCOL v0.2 this calls ``GET /v1/sessions/presence``. The
+    kernel owns the derived view (rebuilt from bus replay on startup,
+    updated in real time on register/heartbeat/end) so no client-side
+    aggregation is needed. Each row includes an ``active`` flag computed
+    against ``active_within_seconds`` and the session's most recent
+    heartbeat/register.
 
     CALL THIS WHEN you need a snapshot of who else is on the bus — e.g. before
     offering a handoff to a specific session, when triaging a stuck multi-
     session workflow, or when a dashboard wants to show currently-online
-    agents. For a live tail, poll this periodically or read the bus directly.
+    agents. For a live tail, poll this periodically or subscribe to
+    ``bus_sessions`` directly.
 
     Arguments:
       active_within_seconds: freshness window (default 600 = 10 min). Sessions
                              whose last heartbeat/register is older than this
-                             are reported but flagged ``"active": False``.
+                             are flagged ``"active": False``.
+      include_ended:         include sessions that have emitted ``session.end``.
+                             Default False.
 
-    Contract: returns ``{"sessions": [...], "count": N}`` on success, or the
-    underlying ``cogos_events_read`` structured error on failure.
+    Contract: returns ``{"sessions": [...], "count": N}`` on success, or
+    ``{"success": False, "error": ..., "bus_id": "bus_sessions"}`` on failure.
     """
-    read = cogos_events_read(bus_id=BUS_SESSIONS, limit=500)
-    if read.get("success") is False:
-        return read
-    events = read.get("events") or []
-
-    # Walk oldest → newest so latest wins; events_read returns in seq order.
-    by_session: dict[str, dict[str, Any]] = {}
-    for ev in events:
-        event_type = ev.get("type", "")
-        if not isinstance(event_type, str) or not event_type.startswith("session."):
-            continue
-        payload = _parse_payload(ev)
-        sid = payload.get("session_id") or ev.get("from")
-        if not isinstance(sid, str) or not sid:
-            continue
-        entry = by_session.setdefault(
-            sid,
-            {
-                "session_id": sid,
-                "status": None,
-                "role": None,
-                "task": None,
-                "workspace": None,
-                "last_seen": None,
-                "last_event_type": None,
-                "context_usage": None,
-                "_ended": False,
-            },
-        )
-        entry["last_event_type"] = event_type
-        # Prefer an explicit timestamp in the payload; fall back to the event's
-        # own timestamp field if present.
-        ts = (
-            payload.get("last_tool_use_at")
-            or payload.get("started_at")
-            or payload.get("ended_at")
-            or ev.get("ts")
-            or ev.get("time")
-        )
-        if ts:
-            entry["last_seen"] = ts
-        if event_type == "session.register":
-            entry["role"] = payload.get("role", entry["role"])
-            entry["task"] = payload.get("task", entry["task"])
-            entry["workspace"] = payload.get("workspace", entry["workspace"])
-            entry["status"] = entry["status"] or "active"
-            entry["_ended"] = False
-        elif event_type == "session.heartbeat":
-            entry["status"] = payload.get("status", entry["status"])
-            if "context_usage" in payload:
-                entry["context_usage"] = payload["context_usage"]
-            if "current_task" in payload:
-                entry["task"] = payload["current_task"]
-        elif event_type == "session.end":
-            entry["status"] = "ended"
-            entry["_ended"] = True
-
-    # Compute active within the freshness window.
-    now = datetime.now(timezone.utc)
-    out: list[dict[str, Any]] = []
-    for entry in by_session.values():
-        active = not entry["_ended"]
-        last_seen = entry.get("last_seen")
-        if active and isinstance(last_seen, str):
-            try:
-                parsed = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                active = (now - parsed).total_seconds() <= active_within_seconds
-            except ValueError:
-                # Unparseable timestamp — be conservative and include the row
-                # but flag it as inactive.
-                active = False
-        elif active and last_seen is None:
-            active = False
-        entry["active"] = active
-        entry.pop("_ended", None)
-        out.append(entry)
-
-    return {"sessions": out, "count": len(out)}
+    params: dict[str, Any] = {"active_within_seconds": active_within_seconds}
+    if include_ended:
+        params["include_ended"] = "true"
+    body = _kernel_get("/v1/sessions/presence", params, BUS_SESSIONS)
+    if isinstance(body, dict) and body.get("success") is False:
+        return body
+    if not isinstance(body, dict):
+        return {
+            "success": False,
+            "error": f"unexpected kernel response shape: {type(body).__name__}",
+            "bus_id": BUS_SESSIONS,
+        }
+    return body
 
 
 def cogos_handoff_offer(
@@ -721,43 +714,55 @@ def cogos_handoff_offer(
     or error dict>}``. Validation errors surface as ``{"success": False,
     "error": ...}`` without contacting the kernel.
     """
-    # Minimal validation per the spec — title, goal, and next_steps must be
-    # non-empty. Everything else is passed through verbatim.
+    # Minimal client-side validation — kernel re-validates so this is
+    # belt-and-suspenders; bail early when input is obviously wrong to
+    # preserve the structured-error contract without a round-trip.
     if not isinstance(task, dict):
         return {
             "success": False,
             "error": f"task must be a dict, got {type(task).__name__}",
+            "bus_id": BUS_HANDOFFS,
         }
     title = task.get("title")
     goal = task.get("goal")
     next_steps = task.get("next_steps")
     if not isinstance(title, str) or not title.strip():
-        return {"success": False, "error": "task.title must be a non-empty string"}
+        return {
+            "success": False,
+            "error": "task.title must be a non-empty string",
+            "bus_id": BUS_HANDOFFS,
+        }
     if not isinstance(goal, str) or not goal.strip():
-        return {"success": False, "error": "task.goal must be a non-empty string"}
+        return {
+            "success": False,
+            "error": "task.goal must be a non-empty string",
+            "bus_id": BUS_HANDOFFS,
+        }
     if not isinstance(next_steps, list) or not next_steps:
-        return {"success": False, "error": "task.next_steps must be a non-empty list"}
+        return {
+            "success": False,
+            "error": "task.next_steps must be a non-empty list",
+            "bus_id": BUS_HANDOFFS,
+        }
 
-    handoff_id = _new_handoff_id()
     payload: dict[str, Any] = {
-        "handoff_id": handoff_id,
         "from_session": from_session,
         "to_session": to_session,
         "reason": reason,
-        "created_at": _utc_now_iso(),
         "ttl_seconds": ttl_seconds,
         "task": task,
         "bootstrap_prompt": bootstrap_prompt,
         "bus_context_refs": list(bus_context_refs) if bus_context_refs else [],
         "memory_refs": list(memory_refs) if memory_refs else [],
     }
-    emit_result = cogos_emit(
-        bus_id=BUS_HANDOFFS,
-        message=json.dumps(payload),
-        from_sender=from_session,
-        event_type="handoff.offer",
-    )
-    return {"handoff_id": handoff_id, "emit_result": emit_result}
+    resp = _kernel_post("/v1/handoffs/offer", payload, BUS_HANDOFFS)
+    # Back-compat: clients of v0.1 expected the response shape
+    # ``{"handoff_id", "emit_result": <emit ack>}``. Preserve that by also
+    # exposing the kernel's response under ``emit_result`` so existing
+    # caller code keeps working unchanged.
+    if isinstance(resp, dict) and resp.get("handoff_id"):
+        return {"handoff_id": resp["handoff_id"], "emit_result": resp}
+    return resp
 
 
 def _aggregate_handoffs(
@@ -840,37 +845,53 @@ def cogos_handoff_list_open(
     state, task_title}``. Structured error from ``cogos_events_read`` on
     failure.
     """
-    read = cogos_events_read(bus_id=BUS_HANDOFFS, limit=500)
-    if read.get("success") is False:
-        return read
-    events = read.get("events") or []
-    grouped = _aggregate_handoffs(events)
-
-    wanted_states = {"open"}
+    # Kernel-native: one GET delegates both filtering and aggregation.
+    # include_claimed=True translates to no kernel-side state filter, so
+    # we fetch the full set and post-filter on the client to keep the
+    # two-state (open + claimed) semantics.
+    params: dict[str, Any] = {}
+    if for_session is not None:
+        params["for_session"] = for_session
+    if not include_claimed:
+        # Default: only open offers — the kernel supports the filter.
+        params["state"] = "open"
+    body = _kernel_get("/v1/handoffs", params, BUS_HANDOFFS)
+    if isinstance(body, dict) and body.get("success") is False:
+        return body
+    if not isinstance(body, dict):
+        return {
+            "success": False,
+            "error": f"unexpected kernel response shape: {type(body).__name__}",
+            "bus_id": BUS_HANDOFFS,
+        }
+    handoffs = body.get("handoffs") or []
     if include_claimed:
-        wanted_states.add("claimed")
-
+        # Post-filter: keep only open + claimed rows, same as v0.1 did.
+        handoffs = [
+            h for h in handoffs
+            if isinstance(h, dict) and h.get("state") in ("open", "claimed")
+        ]
+    # Reshape to v0.1-shaped entries so callers that iterate
+    # ``entry["task_title"]`` etc. keep working.
     out: list[dict[str, Any]] = []
-    for hid, entry in grouped.items():
-        if entry["state"] not in wanted_states:
+    for entry in handoffs:
+        if not isinstance(entry, dict):
             continue
-        if for_session is not None:
-            to_sess = entry.get("to_session")
-            if to_sess is not None and to_sess != for_session:
-                continue
+        offer = entry.get("offer") or {}
+        task = offer.get("task") if isinstance(offer, dict) else None
+        task_title = task.get("title") if isinstance(task, dict) else None
         out.append(
             {
-                "handoff_id": hid,
+                "handoff_id": entry.get("handoff_id"),
                 "from_session": entry.get("from_session"),
                 "to_session": entry.get("to_session"),
                 "reason": entry.get("reason"),
                 "created_at": entry.get("created_at"),
                 "ttl_seconds": entry.get("ttl_seconds"),
                 "state": entry.get("state"),
-                "task_title": entry.get("task_title"),
+                "task_title": task_title,
             }
         )
-
     return {"handoffs": out, "count": len(out)}
 
 
@@ -901,46 +922,35 @@ def cogos_handoff_claim(handoff_id: str, claiming_session: str) -> dict[str, Any
     ...}`` WITHOUT emitting the claim (avoid polluting the bus with claims
     against phantom offers).
     """
-    read = cogos_events_read(bus_id=BUS_HANDOFFS, limit=500)
-    if read.get("success") is False:
-        return {
-            "success": False,
-            "error": f"could not read bus_handoffs: {read.get('error')}",
-            "handoff_id": handoff_id,
-        }
-    events = read.get("events") or []
-    offer_payload: dict[str, Any] | None = None
-    for ev in events:
-        if ev.get("type") != "handoff.offer":
-            continue
-        payload = _parse_payload(ev)
-        if payload.get("handoff_id") == handoff_id:
-            offer_payload = payload
-            break
-    if offer_payload is None:
-        return {
-            "success": False,
-            "error": f"no handoff.offer found for handoff_id={handoff_id}",
-            "handoff_id": handoff_id,
-        }
-
-    claim_payload = {
-        "handoff_id": handoff_id,
-        "claiming_session": claiming_session,
-        "previous_session": offer_payload.get("from_session"),
-        "claimed_at": _utc_now_iso(),
-    }
-    claim_emitted = cogos_emit(
-        bus_id=BUS_HANDOFFS,
-        message=json.dumps(claim_payload),
-        from_sender=claiming_session,
-        event_type="handoff.claim",
+    # Kernel-native atomic claim — first-wins enforced server-side under
+    # mutex. Replaces the racy read-then-emit dance the v0.1 bridge did.
+    # On rejection the kernel also emits a handoff.claim_rejected event to
+    # bus_handoffs for observability (see HANDOFF_PROTOCOL v0.2 §Atomic
+    # claim and amendment #4 of the hybrid landing plan).
+    payload = {"claiming_session": claiming_session}
+    body = _kernel_post(
+        f"/v1/handoffs/{handoff_id}/claim", payload, BUS_HANDOFFS
     )
-    return {
-        "handoff_id": handoff_id,
-        "claim_emitted": claim_emitted,
-        "offer": offer_payload,
-    }
+    if isinstance(body, dict) and body.get("success") is False:
+        # Keep the legacy shape expected by callers: they check for
+        # ``success == False`` and read ``error``.
+        body.setdefault("handoff_id", handoff_id)
+        return body
+    # Back-compat: v0.1 returned ``{handoff_id, claim_emitted, offer}``.
+    # The kernel returns the same ``handoff_id`` + ``seq`` + ``hash`` +
+    # ``handoff`` (full state) + ``offer`` (payload). Map it through.
+    if isinstance(body, dict) and body.get("handoff_id"):
+        return {
+            "handoff_id": body["handoff_id"],
+            "claim_emitted": {
+                "ok": body.get("ok", True),
+                "seq": body.get("seq"),
+                "hash": body.get("hash"),
+            },
+            "offer": body.get("offer", {}),
+            "handoff": body.get("handoff"),
+        }
+    return body
 
 
 def cogos_handoff_complete(
@@ -971,20 +981,15 @@ def cogos_handoff_complete(
     Contract: returns whatever ``cogos_emit`` returns.
     """
     payload: dict[str, Any] = {
-        "handoff_id": handoff_id,
         "completing_session": completing_session,
         "outcome": outcome,
-        "completed_at": _utc_now_iso(),
     }
     if notes is not None:
         payload["notes"] = notes
     if next_handoff_id is not None:
         payload["next_handoff_id"] = next_handoff_id
-    return cogos_emit(
-        bus_id=BUS_HANDOFFS,
-        message=json.dumps(payload),
-        from_sender=completing_session,
-        event_type="handoff.complete",
+    return _kernel_post(
+        f"/v1/handoffs/{handoff_id}/complete", payload, BUS_HANDOFFS
     )
 
 
