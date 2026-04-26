@@ -27,6 +27,12 @@ class Rubric:
     content_must_not_contain: list[str] = field(default_factory=list)
     """Strings that must NOT appear in the final content (e.g. leaked sandbox_root)."""
 
+    content_contains_ci: list[str] = field(default_factory=list)
+    """Case-insensitive variant of content_contains. Each string must appear (case-insensitive) in the assistant's final text."""
+
+    content_must_not_contain_ci: list[str] = field(default_factory=list)
+    """Case-insensitive variant of content_must_not_contain."""
+
     first_tool_one_of: list[str] = field(default_factory=list)
     """The FIRST tool call (if any) must be one of these — catches idiom choice."""
 
