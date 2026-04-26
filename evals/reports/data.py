@@ -76,6 +76,12 @@ class TrialRecord:
     are actually applied during dispatch. False in Phase 1 — TD variants are documented
     but tool descriptions are not overridden at dispatch time."""
 
+    parametric_mode: bool = False
+    """True when the trial was dispatched with tools=[] and a no-tool system prompt
+    override. Records that the harness gave the model no tool surface — answer came
+    entirely from parametric (pre-trained) knowledge, not from tool-assisted retrieval.
+    Enables fair comparison of (model, harness, tool-surface) tuples."""
+
 
 @dataclass
 class RunSummary:

@@ -233,13 +233,33 @@ class KernelMCPClient:
         iss: str | None = None,
         sub: str | None = None,
         timeout_seconds: int = 60,
+        no_tools: bool = False,
     ) -> AgenticResult:
         """Dispatch one trial via cog_dispatch_to_harness.
 
         Maps to DispatchRequest fields in internal/engine/agent_dispatch.go:
           Task, SystemPrompt, Tools, Model, TimeoutSeconds, Identity.Iss/Sub
         N is always 1 for sequential tournament trials.
+
+        no_tools=True activates parametric mode: sends tools=[] (empty allowlist)
+        so the harness exposes no tools. The system prompt is prefixed with a
+        directive telling the model to answer from knowledge directly.
+        This isolates parametric knowledge from tool-assisted retrieval.
         """
+        # Parametric mode: empty tool allowlist + prepend a no-tool directive.
+        if no_tools:
+            _PARAMETRIC_DIRECTIVE = (
+                "Answer directly from your knowledge. "
+                "Do not attempt tool calls. "
+                "If you don't know, say so."
+            )
+            if system_prompt:
+                system_prompt = f"{_PARAMETRIC_DIRECTIVE}\n\n{system_prompt}"
+            else:
+                system_prompt = _PARAMETRIC_DIRECTIVE
+            # tools=[] signals an empty allowlist to the harness dispatcher.
+            tools = []
+
         args: dict[str, Any] = {
             "task": task,
             "model": model,
@@ -248,7 +268,9 @@ class KernelMCPClient:
         }
         if system_prompt:
             args["system_prompt"] = system_prompt
-        if tools:
+        # Send tools even when empty list — empty allowlist is distinct from
+        # None (which lets the harness use its default registry).
+        if tools is not None:
             args["tools"] = tools
         if iss:
             args["iss"] = iss
