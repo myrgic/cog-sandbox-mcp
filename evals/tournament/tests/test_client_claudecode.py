@@ -122,6 +122,16 @@ def _make_client_stub(responses: list[dict]) -> tuple[ClaudeCodeClient, list[dic
             timeout=30.0,
             headers={"Content-Type": "application/json"},
         )
+        # Stub ledger collector — returns empty by default so tests focus on chat-
+        # completions routing without needing a live kernel for ledger queries.
+        from unittest.mock import MagicMock as _MM
+        from evals.tournament.ledger_evidence import CollectionStats as _CS
+        mock_ledger = _MM()
+        mock_ledger.collect.return_value = (
+            [],
+            _CS(window_start="", window_end="", raw_count=0, returned_count=0),
+        )
+        client._ledger = mock_ledger
 
     return client, captured
 
