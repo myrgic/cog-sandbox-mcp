@@ -36,10 +36,26 @@ recording explicit tool_calls in the chat response. This means rubric checks
 that require tool_calls[] will always FAIL in claude mode.
 
 Implication: claude-code trial results measure answer quality (content_contains_*
-rubrics) but NOT tool-call compliance (expected_tools, first_tool_one_of). To
-get tool_call traces from Claude, use cog_dispatch_to_harness (kernel mode) with
-model=sonnet, which will route through claude-code and record tool calls in the
-kernel ledger. See feat/claude-baseline-target PR for full analysis.
+rubrics) but NOT tool-call compliance (expected_tools, first_tool_one_of).
+
+There is NO kernel-side workaround via cog_dispatch_to_harness today.
+HarnessDispatcher.DispatchToHarness in cogos-dev/cogos/agent_dispatch.go (lines
+113-125) only switches between two model routes: DispatchModel26B (LM Studio
+OpenAI-compat) and DispatchModelE4B (local Ollama, default). Unknown model
+strings — including "sonnet", "claude-sonnet-4-6", anything else — silently
+fall through to e4b. Verified live 2026-04-26: a probe call with model="sonnet"
+returned in 1.9s with model_used="e4b" stamped in DispatchResult.stats.
+
+Two paths to actually record Claude tool_calls in the kernel ledger would be:
+  (a) Add a claude-code branch to HarnessDispatcher (Go change, kernel rebuild)
+      that uses ClaudeCodeProvider with --output-format stream-json and parses
+      tool_use events into DispatchToolCallSummary entries, OR
+  (b) Have the runner consume claude -p stream-json directly (bypass kernel)
+      and emit synthesized ToolCall entries into TrialRecord, then optionally
+      persist via cog_emit. This sidesteps the kernel ledger entirely.
+
+Until either lands, --dispatch-mode claude trials must use rubrics that don't
+require tool_calls[].
 """
 
 from __future__ import annotations
@@ -501,6 +517,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Kernel base URL (kernel dispatch mode only). Default: http://localhost:6931",
     )
     parser.add_argument(
+        "--claude-model",
+        default=os.environ.get("COG_EVAL_CLAUDE_MODEL", "sonnet"),
+        help=(
+            "Model name for --dispatch-mode claude. The kernel router resolves "
+            "this to the claude-code subprocess provider (Max OAuth, no API key). "
+            "Common values: 'sonnet', 'haiku'. Default: sonnet."
+        ),
+    )
+    parser.add_argument(
         "--base-url",
         default=os.environ.get("LMS_API_BASE_URL", "http://localhost:1234"),
         help="LM Studio base URL (lms dispatch mode only). Default: http://localhost:1234",
@@ -564,11 +589,13 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "    Auth: Claude Max OAuth (keychain) — no ANTHROPIC_API_KEY used"
         )
+        print(f"    Model: {args.claude_model}")
         client: (
             LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient | ClaudeCodeClient
         ) = ClaudeCodeClient(
             kernel_url=effective_base_url,
             timeout=180.0,
+            model=args.claude_model,
         )
     elif args.dispatch_mode == "kernel":
         # Kernel dispatch: cog_dispatch_to_harness via MCP session
