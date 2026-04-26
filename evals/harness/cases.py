@@ -33,6 +33,9 @@ class Rubric:
     content_must_not_contain_ci: list[str] = field(default_factory=list)
     """Case-insensitive variant of content_must_not_contain."""
 
+    content_contains_any_of_ci: list[str] = field(default_factory=list)
+    """Case-insensitive ANY_OF — pass if at least ONE listed substring appears (case-insensitive)."""
+
     first_tool_one_of: list[str] = field(default_factory=list)
     """The FIRST tool call (if any) must be one of these — catches idiom choice."""
 
