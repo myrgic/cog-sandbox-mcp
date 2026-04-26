@@ -57,4 +57,13 @@ def score(rubric: Rubric, result: Any) -> Verdict:
         if forbid in content:
             failures.append(f"content_must_not_contain: {forbid!r} appeared in content")
 
+    content_lower = content.lower()
+    for needle in rubric.content_contains_ci:
+        if needle.lower() not in content_lower:
+            failures.append(f"content_contains_ci: {needle!r} not in content (case-insensitive)")
+
+    for forbid in rubric.content_must_not_contain_ci:
+        if forbid.lower() in content_lower:
+            failures.append(f"content_must_not_contain_ci: {forbid!r} appeared in content (case-insensitive)")
+
     return Verdict(passed=not failures, failures=failures, notes=notes)
