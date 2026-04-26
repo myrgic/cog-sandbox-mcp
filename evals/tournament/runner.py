@@ -129,6 +129,9 @@ def _run_trial(
         forbidden_tools=rubric_data.get("forbidden_tools") or [],
         content_contains=rubric_data.get("content_contains") or [],
         content_must_not_contain=rubric_data.get("content_must_not_contain") or [],
+        content_contains_ci=rubric_data.get("content_contains_ci") or [],
+        content_must_not_contain_ci=rubric_data.get("content_must_not_contain_ci") or [],
+        content_contains_any_of_ci=rubric_data.get("content_contains_any_of_ci") or [],
         first_tool_one_of=rubric_data.get("first_tool_one_of") or [],
     )
     max_tokens = task_content.get("max_tokens", 1024)
