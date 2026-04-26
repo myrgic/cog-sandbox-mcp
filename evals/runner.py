@@ -25,9 +25,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import datetime
+
 from evals.harness.cases import Case, load_cases
 from evals.harness.client import AgenticResult, LMStudioAgenticClient, ToolCall
 from evals.harness.scoring import Verdict, score
+from evals.reports.data import RunSummary, TrialRecord
+from evals.reports.html import render_html
 
 
 def _default_cases_dir() -> Path:
@@ -112,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         help="MCP plugin identifier (can repeat). Default: mcp/cog-sandbox",
     )
     parser.add_argument("--save-trace", type=Path, help="JSONL output path for full per-case traces")
+    parser.add_argument("--html-report", type=Path, help="Write a self-contained HTML report to this path after the run")
     args = parser.parse_args(argv)
 
     plugin_ids = args.plugin_id or [os.environ.get("COG_EVAL_PLUGIN_ID", "mcp/cog-sandbox")]
@@ -140,15 +145,40 @@ def main(argv: list[str] | None = None) -> int:
     client = LMStudioAgenticClient(base_url=args.base_url, api_token=token)
     trace_fh = args.save_trace.open("w", encoding="utf-8") if args.save_trace else None
 
+    run_started_at = datetime.datetime.now(datetime.timezone.utc)
+    run_id = run_started_at.strftime("run-%Y%m%dT%H%M%SZ")
+
     passed = 0
     failed = 0
+    trials: list[TrialRecord] = []
     try:
         for case in cases:
+            trial_ts = datetime.datetime.now(datetime.timezone.utc)
             try:
                 result, verdict = run_case(case, client, args.model, plugin_ids)
             except Exception as e:
                 print(f"  [FAIL]{case.name}  ERROR: {type(e).__name__}: {e}")
                 failed += 1
+                # Record a failed trial with no result data so the report is complete.
+                trials.append(TrialRecord(
+                    trial_id=f"{run_id}_{case.name}",
+                    experiment_id="evals-runner",
+                    variant_ids={},
+                    task_id=case.name,
+                    target=args.base_url,
+                    passed=False,
+                    failures=[f"{type(e).__name__}: {e}"],
+                    notes=[],
+                    tool_calls=[],
+                    content="",
+                    reasoning="",
+                    timestamp=trial_ts.isoformat(),
+                    model=args.model,
+                    base_url=args.base_url,
+                    judge_identity_uri=None,
+                    cogblock_hash=None,
+                    td_wired=True,
+                ))
                 continue
             label = "[PASS]" if verdict.passed else "[FAIL]"
             print(f"  {label}{case.name}")
@@ -160,6 +190,28 @@ def main(argv: list[str] | None = None) -> int:
                 failed += 1
             else:
                 passed += 1
+            trials.append(TrialRecord(
+                trial_id=f"{run_id}_{case.name}",
+                experiment_id="evals-runner",
+                variant_ids={},
+                task_id=case.name,
+                target=args.base_url,
+                passed=verdict.passed,
+                failures=verdict.failures,
+                notes=verdict.notes,
+                tool_calls=[
+                    {"name": tc.name, "arguments": tc.arguments, "result": tc.result}
+                    for tc in result.tool_calls
+                ],
+                content=result.content,
+                reasoning=result.reasoning,
+                timestamp=trial_ts.isoformat(),
+                model=args.model,
+                base_url=args.base_url,
+                judge_identity_uri=None,
+                cogblock_hash=None,
+                td_wired=True,
+            ))
             if trace_fh:
                 trace_fh.write(
                     json.dumps(
@@ -186,7 +238,27 @@ def main(argv: list[str] | None = None) -> int:
         if trace_fh:
             trace_fh.close()
 
+    run_ended_at = datetime.datetime.now(datetime.timezone.utc)
+    summary = RunSummary(
+        experiment_id="evals-runner",
+        run_id=run_id,
+        started_at=run_started_at.isoformat(),
+        ended_at=run_ended_at.isoformat(),
+        total=len(cases),
+        passed=passed,
+        failed=failed,
+        target=args.base_url,
+        model=args.model,
+    )
+
     print(f"\n==> {passed} passed, {failed} failed ({len(cases)} total)")
+
+    if args.html_report:
+        html = render_html(trials, summary, brief_path=None)
+        args.html_report.parent.mkdir(parents=True, exist_ok=True)
+        args.html_report.write_text(html, encoding="utf-8")
+        print(f"==> HTML report written to {args.html_report}")
+
     return 0 if failed == 0 else 1
 
 
