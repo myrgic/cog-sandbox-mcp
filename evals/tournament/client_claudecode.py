@@ -29,12 +29,14 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
 from evals.harness.client import AgenticResult, ToolCall
 from evals.tournament.client_kernel import _MCPSession
+from evals.tournament.ledger_evidence import LedgerToolCallCollector
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +123,10 @@ class ClaudeCodeClient:
         self._mcp = _MCPSession(base_url=self.kernel_url, timeout=timeout)
         self._mcp.initialize()
 
+        # Ledger collector: queries kernel for tool.call events in a time window.
+        # Separate MCP session from _mcp so dispatch and ledger queries don't interfere.
+        self._ledger = LedgerToolCallCollector(kernel_url=self.kernel_url, timeout=timeout)
+
         # Fetch base tool list from kernel once; filter to harness scope
         self._base_tools: list[dict[str, Any]] = self._fetch_base_tools()
         log.debug(
@@ -178,6 +184,11 @@ class ClaudeCodeClient:
         final_content = ""
         total_input_tokens = 0
         total_output_tokens = 0
+
+        # Record wall-clock window for ledger evidence collection.
+        # We capture start BEFORE the first HTTP request and end AFTER the loop
+        # completes, then query the ledger for tool.call events in that window.
+        dispatch_start: datetime = datetime.now(timezone.utc)
 
         # Turn loop — same structure as ChatCompletionsClient.dispatch()
         for turn in range(MAX_TURNS):
@@ -292,9 +303,79 @@ class ClaudeCodeClient:
             )
             final_content = final_content or "(max turns reached)"
 
+        # --- Ledger evidence collection ---
+        # The kernel's claude-code subprocess provider runs its own internal tool loop.
+        # Tool calls made by claude -p do NOT appear in the chat-completions response
+        # (collected_tool_calls is empty for the subprocess path). Query the kernel
+        # ledger for tool.call events that landed in the dispatch window, then use
+        # whichever source is non-empty (prefer ledger when it finds calls).
+        dispatch_end: datetime = datetime.now(timezone.utc)
+
+        ledger_tool_calls: list[ToolCall] = []
+        ledger_stats: dict[str, Any] = {}
+        try:
+            ledger_tool_calls, coll_stats = self._ledger.collect(
+                start=dispatch_start,
+                end=dispatch_end,
+                # Exclude infrastructure / ledger-query tool names so the collector
+                # doesn't return its own calls or unrelated session housekeeping.
+                exclude_tool_names={
+                    "cog_read_tool_calls",
+                    "cog_tail_tool_calls",
+                    "cog_read_ledger",
+                    "cog_tail_events",
+                    "cog_list_sessions",
+                    "cog_register_session",
+                    "cog_end_session",
+                    "cog_heartbeat_session",
+                },
+            )
+            ledger_stats = {
+                "ledger_raw_count": coll_stats.raw_count,
+                "ledger_returned_count": coll_stats.returned_count,
+                "ledger_window_start": coll_stats.window_start,
+                "ledger_window_end": coll_stats.window_end,
+            }
+            if coll_stats.warning:
+                ledger_stats["ledger_warning"] = coll_stats.warning
+        except Exception as e:
+            log.warning("ClaudeCodeClient: ledger evidence collection failed: %s", e)
+            ledger_stats = {"ledger_error": str(e)}
+
+        # Prefer ledger evidence over the (usually empty) in-loop list.
+        # If both are non-empty (edge case: response DID surface tool calls AND
+        # ledger also found some), merge them deduplicated by name+call_id.
+        if ledger_tool_calls:
+            if collected_tool_calls:
+                # Merge: ledger calls are more complete; keep them, add any chat-
+                # completions calls not already covered by ledger (by call_id).
+                ledger_ids = {tc.call_id for tc in ledger_tool_calls if tc.call_id}
+                extra = [tc for tc in collected_tool_calls if tc.call_id not in ledger_ids]
+                final_tool_calls = ledger_tool_calls + extra
+                log.debug(
+                    "ClaudeCodeClient: merged %d ledger + %d extra chat-completions tool calls",
+                    len(ledger_tool_calls), len(extra),
+                )
+            else:
+                final_tool_calls = ledger_tool_calls
+                log.debug(
+                    "ClaudeCodeClient: using %d ledger tool calls (chat-completions had none)",
+                    len(ledger_tool_calls),
+                )
+        else:
+            # Ledger returned nothing — fall back to in-loop calls (may also be empty)
+            final_tool_calls = collected_tool_calls
+            if not collected_tool_calls:
+                log.debug(
+                    "ClaudeCodeClient: no tool calls found in ledger or chat-completions "
+                    "response (window: %s → %s)",
+                    ledger_stats.get("ledger_window_start", "?"),
+                    ledger_stats.get("ledger_window_end", "?"),
+                )
+
         return AgenticResult(
             content=final_content,
-            tool_calls=collected_tool_calls,
+            tool_calls=final_tool_calls,
             reasoning="",
             output_types=output_types,
             stats={
@@ -303,6 +384,7 @@ class ClaudeCodeClient:
                 "output_tokens": total_output_tokens,
                 "client": "claude_code",
                 "model": effective_model,
+                **ledger_stats,
             },
             raw={},
         )
@@ -310,3 +392,4 @@ class ClaudeCodeClient:
     def close(self) -> None:
         self._http.close()
         self._mcp.close()
+        self._ledger.close()
