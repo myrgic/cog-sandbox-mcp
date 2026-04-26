@@ -157,6 +157,7 @@ def _run_trial(
     model: str,
     plugin_ids: list[str],
     chat_client: ChatCompletionsClient | None = None,
+    parametric_mode: bool = False,
 ) -> tuple[AgenticResult, Verdict]:
     """Execute a single trial spec and return (result, verdict).
 
@@ -240,11 +241,12 @@ def _run_trial(
         result = client.dispatch(
             task=prompt,
             system_prompt=sp_text,
-            tools=None,  # kernel default tool registry
+            tools=None,  # kernel default tool registry (overridden when no_tools=True)
             model=model,
             iss="tournament",
             sub=spec.variant_ids.get("system_prompt", spec.experiment_id),
             timeout_seconds=max(60, max_tokens // 10),
+            no_tools=parametric_mode,
         )
     elif isinstance(client, ChatCompletionsClient):
         # Direct ChatCompletionsClient mode (--dispatch-mode chat, baseline TD)
@@ -282,6 +284,7 @@ def _make_trial_record(
     timestamp: str,
     duration_sec: float,
     td_wired: bool,
+    parametric_mode: bool = False,
 ) -> TrialRecord:
     """Build a TrialRecord from the trial components."""
     tool_calls_data = [
@@ -306,6 +309,7 @@ def _make_trial_record(
         base_url=base_url,
         judge_identity_uri=None,  # Set by caller for judge-required tasks
         td_wired=td_wired,
+        parametric_mode=parametric_mode,
     )
 
 
@@ -320,6 +324,7 @@ def run_experiment(
     run_store: RunStore | None = None,
     target_override: str | None = None,
     chat_client: ChatCompletionsClient | None = None,
+    parametric_mode: bool = False,
 ) -> tuple[list[TrialRecord], RunSummary]:
     """Run all trials for an experiment. Returns (trials, summary)."""
     # Load variants and experiment
@@ -355,12 +360,13 @@ def run_experiment(
     store = run_store or RunStore()
     run_dir = store.run_dir(experiment_id, ts_str) if save_runs else None
 
+    mode_tag = " [PARAMETRIC — no tool surface]" if parametric_mode else ""
     print(
         f"==> Tournament: {experiment.title}\n"
         f"    {len(specs)} trials across {len(experiment.task_ids)} tasks\n"
         f"    Model: {model} @ {base_url}\n"
         f"    Target: {effective_target}\n"
-        f"    Run ID: {run_id}"
+        f"    Run ID: {run_id}{mode_tag}"
     )
 
     trials: list[TrialRecord] = []
@@ -381,7 +387,11 @@ def run_experiment(
         )
 
         try:
-            result, verdict = _run_trial(spec, client, model, plugin_ids, chat_client=chat_client)
+            result, verdict = _run_trial(
+                spec, client, model, plugin_ids,
+                chat_client=chat_client,
+                parametric_mode=parametric_mode,
+            )
         except Exception as e:
             elapsed = time.monotonic() - t0
             log.warning("Trial %s failed with exception: %s", spec.trial_id, e)
@@ -415,6 +425,7 @@ def run_experiment(
             timestamp=ts_trial,
             duration_sec=elapsed,
             td_wired=td_wired,
+            parametric_mode=parametric_mode,
         )
 
         # Emit CogBlock (best-effort)
@@ -559,6 +570,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip CogBlock emission. Default: off (emit CogBlocks when kernel is reachable).",
     )
     parser.add_argument(
+        "--no-tools",
+        action="store_true",
+        default=False,
+        dest="no_tools",
+        help=(
+            "Parametric dispatch mode: send tools=[] to the harness so the model has no "
+            "tool surface. A directive is prepended to the system prompt: "
+            "'Answer directly from your knowledge. Do not attempt tool calls. If you don't "
+            "know, say so.' TrialRecord.parametric_mode is set to True. "
+            "Only valid with --dispatch-mode kernel. "
+            "Use to evaluate (model, harness, no-tool-surface) tuples for tasks that "
+            "don't require tool-assisted retrieval."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -576,6 +602,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # Build the inference client
     chat_client: ChatCompletionsClient | None = None
+
+    # --no-tools is only meaningful for kernel mode (harness-mediated dispatch).
+    if args.no_tools and args.dispatch_mode != "kernel":
+        print(
+            f"error: --no-tools is only supported with --dispatch-mode kernel "
+            f"(got {args.dispatch_mode!r}). lms/chat/claude routes do not go through "
+            "cog_dispatch_to_harness and cannot be given an empty tool allowlist this way.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.dispatch_mode == "claude":
         # Claude baseline: kernel /v1/chat/completions → claude-code subprocess.
@@ -610,7 +646,8 @@ def main(argv: list[str] | None = None) -> int:
         model = args.model if args.model != "google/gemma-4-26b-a4b" else os.environ.get("COG_EVAL_MODEL", "e4b")
         effective_base_url = args.kernel_url
         lms_model = os.environ.get("LMS_CHAT_MODEL", "f29de68cb284ca208446e647b339569935025ef3")
-        print(f"==> Dispatch mode: kernel @ {effective_base_url}")
+        mode_label = "kernel (parametric — no tool surface)" if args.no_tools else "kernel"
+        print(f"==> Dispatch mode: {mode_label} @ {effective_base_url}")
         client = KernelMCPClient(
             base_url=effective_base_url,
             timeout=180.0,
@@ -681,6 +718,7 @@ def main(argv: list[str] | None = None) -> int:
             emit_cogblocks=not args.no_cogblocks,
             target_override=args.target,
             chat_client=chat_client,
+            parametric_mode=args.no_tools,
         )
     except Exception as e:
         print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
