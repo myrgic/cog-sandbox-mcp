@@ -18,8 +18,10 @@ See memory: feedback_ollama_single_thread_constraint.md — the kernel's harness
 serializes at Ollama; firing concurrent dispatches would pile up behind the same
 single thread, competing with the metabolic ticker and background work.
 
-Phase 1 limitation: TD overrides are not yet wired into dispatch — only SP
-variants are varied. A warning is logged per trial when td_wired=False.
+Phase 2: TD overrides are wired via ChatCompletionsClient (client_chat.py).
+Trials with a non-baseline TD variant route to LMS /v1/chat/completions with
+per-trial tool-description overrides applied. Baseline TD trials continue
+through KernelMCPClient (cog_dispatch_to_harness).
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from evals.harness.cases import Case
 from evals.harness.client import AgenticResult, LMStudioAgenticClient, ToolCall
 from evals.harness.scoring import Verdict, score
 from evals.tournament.client_kernel import KernelMCPClient
+from evals.tournament.client_chat import ChatCompletionsClient
 from evals.reports.data import RunSummary, TrialRecord, save_trial_jsonl
 from evals.reports.html import render_html
 from evals.reports.md import render_markdown
@@ -105,18 +108,30 @@ def _agentic_to_scorable(result: AgenticResult) -> Any:
     return shim
 
 
+def _is_td_nonbaseline(spec: TrialSpec) -> bool:
+    """True when the trial's TD variant is non-baseline (needs ChatCompletionsClient)."""
+    return bool(
+        spec.tool_description_variant
+        and spec.tool_description_variant.id != "td-1-current"
+    )
+
+
 def _run_trial(
     spec: TrialSpec,
-    client: LMStudioAgenticClient | KernelMCPClient,
+    client: LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient,
     model: str,
     plugin_ids: list[str],
+    chat_client: ChatCompletionsClient | None = None,
 ) -> tuple[AgenticResult, Verdict]:
     """Execute a single trial spec and return (result, verdict).
 
-    Routes to either LMStudioAgenticClient.run() or KernelMCPClient.dispatch()
-    based on the client type. The SP variant is passed as a separate system_prompt
-    override in kernel mode (DispatchRequest.SystemPrompt per agent_dispatch.go:83)
-    rather than baked into the prompt preamble.
+    Routing logic (Phase 2):
+    - TD non-baseline variant → chat_client (ChatCompletionsClient) with per-trial
+      description overrides. If chat_client is None, falls back with a warning.
+    - TD baseline or no TD axis + KernelMCPClient → kernel dispatch.
+    - LMStudioAgenticClient → legacy LMS plugin path (lms dispatch mode).
+
+    The SP variant is passed as system_prompt to both kernel and chat paths.
     """
     # Build the Case from the task variant
     task_content = spec.task_variant.content or {}
@@ -136,23 +151,49 @@ def _run_trial(
     )
     max_tokens = task_content.get("max_tokens", 1024)
 
-    # Phase 1: TD variant is documented but not yet wired (Phase 2 work)
-    if spec.tool_description_variant and spec.tool_description_variant.id != "td-1-current":
-        log.warning(
-            "Trial %s: TD variant %r is not yet wired into dispatch (Phase 2). "
-            "Using baseline tool descriptions. td_wired=False.",
-            spec.trial_id,
-            spec.tool_description_variant.id,
-        )
+    # Extract SP text for all dispatch paths
+    sp_text: str | None = None
+    if spec.system_prompt_variant and spec.system_prompt_variant.content:
+        sp_text = spec.system_prompt_variant.content
 
-    # Dispatch — split by client type
+    # Route: non-baseline TD → ChatCompletionsClient (Phase 2)
+    if _is_td_nonbaseline(spec):
+        if chat_client is None:
+            log.warning(
+                "Trial %s: TD variant %r requires ChatCompletionsClient but none "
+                "was provided. Using baseline tool descriptions. td_wired=False.",
+                spec.trial_id,
+                spec.tool_description_variant.id if spec.tool_description_variant else "?",
+            )
+        else:
+            # Apply TD overrides from the variant's content dict
+            td_overrides: dict[str, str] = {}
+            if spec.tool_description_variant and isinstance(
+                spec.tool_description_variant.content, dict
+            ):
+                td_overrides = {
+                    k: v
+                    for k, v in spec.tool_description_variant.content.items()
+                    if isinstance(v, str)
+                }
+            log.debug(
+                "Trial %s: routing to ChatCompletionsClient with %d TD overrides (variant=%s)",
+                spec.trial_id,
+                len(td_overrides),
+                spec.tool_description_variant.id if spec.tool_description_variant else "?",
+            )
+            result = chat_client.dispatch(
+                task=prompt,
+                system_prompt=sp_text,
+                td_overrides=td_overrides,
+                model=model,
+                max_tokens=max_tokens,
+            )
+            verdict = score(rubric, _agentic_to_scorable(result))
+            return result, verdict
+
+    # Route: kernel dispatch (baseline TD or no TD axis)
     if isinstance(client, KernelMCPClient):
-        # Kernel mode: system_prompt passed as DispatchRequest.SystemPrompt override.
-        # The prompt itself is the task content (no [system]/[/system] preamble needed).
-        sp_text: str | None = None
-        if spec.system_prompt_variant and spec.system_prompt_variant.content:
-            sp_text = spec.system_prompt_variant.content
-
         result = client.dispatch(
             task=prompt,
             system_prompt=sp_text,
@@ -162,10 +203,18 @@ def _run_trial(
             sub=spec.variant_ids.get("system_prompt", spec.experiment_id),
             timeout_seconds=max(60, max_tokens // 10),
         )
+    elif isinstance(client, ChatCompletionsClient):
+        # Direct ChatCompletionsClient mode (--dispatch-mode chat, baseline TD)
+        result = client.dispatch(
+            task=prompt,
+            system_prompt=sp_text,
+            td_overrides={},  # baseline: no overrides
+            model=model,
+            max_tokens=max_tokens,
+        )
     else:
-        # LMS mode: bake SP into the prompt preamble (original Phase 1 approach)
-        if spec.system_prompt_variant and spec.system_prompt_variant.content:
-            sp_text = spec.system_prompt_variant.content
+        # LMS mode: bake SP into the prompt preamble (legacy Phase 1 approach)
+        if sp_text:
             effective_prompt = f"[system]\n{sp_text}\n[/system]\n\n{prompt}"
         else:
             effective_prompt = prompt
@@ -219,7 +268,7 @@ def _make_trial_record(
 
 def run_experiment(
     experiment_id: str,
-    client: LMStudioAgenticClient | KernelMCPClient,
+    client: LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient,
     model: str,
     plugin_ids: list[str],
     base_url: str,
@@ -227,6 +276,7 @@ def run_experiment(
     emit_cogblocks: bool = True,
     run_store: RunStore | None = None,
     target_override: str | None = None,
+    chat_client: ChatCompletionsClient | None = None,
 ) -> tuple[list[TrialRecord], RunSummary]:
     """Run all trials for an experiment. Returns (trials, summary)."""
     # Load variants and experiment
@@ -281,14 +331,14 @@ def run_experiment(
 
         ts_trial = datetime.now(timezone.utc).isoformat()
         t0 = time.monotonic()
-        # td_wired=False when TD variant is non-baseline (not yet implemented in Phase 1)
-        td_wired = not (
-            spec.tool_description_variant
-            and spec.tool_description_variant.id != "td-1-current"
+        # td_wired=True when: (a) TD is baseline (no override needed), or
+        # (b) TD is non-baseline AND chat_client is available to apply overrides.
+        td_wired = not _is_td_nonbaseline(spec) or (
+            _is_td_nonbaseline(spec) and chat_client is not None
         )
 
         try:
-            result, verdict = _run_trial(spec, client, model, plugin_ids)
+            result, verdict = _run_trial(spec, client, model, plugin_ids, chat_client=chat_client)
         except Exception as e:
             elapsed = time.monotonic() - t0
             log.warning("Trial %s failed with exception: %s", spec.trial_id, e)
@@ -406,12 +456,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--dispatch-mode",
-        choices=["kernel", "lms"],
+        choices=["kernel", "lms", "chat"],
         default="kernel",
         help=(
             "Dispatch backend. 'kernel' (default): routes via cog_dispatch_to_harness "
             "against http://localhost:6931/mcp — kernel owns inference + tool execution. "
-            "'lms': routes via LM Studio /api/v1/chat plugin endpoint (comparison/regression path)."
+            "'lms': routes via LM Studio /api/v1/chat plugin endpoint (comparison/regression path). "
+            "'chat': routes all trials via LMS /v1/chat/completions (TD axis always active)."
         ),
     )
     parser.add_argument(
@@ -466,22 +517,63 @@ def main(argv: list[str] | None = None) -> int:
 
     plugin_ids = args.plugin_id or [os.environ.get("COG_EVAL_PLUGIN_ID", "mcp/cog-sandbox")]
 
+    token = os.environ.get("LMS_API_TOKEN", "").strip()
+
     # Build the inference client
+    chat_client: ChatCompletionsClient | None = None
+
     if args.dispatch_mode == "kernel":
         # Kernel dispatch: cog_dispatch_to_harness via MCP session
         # Model default changes to e4b for kernel mode (Ollama, not LMS)
         model = args.model if args.model != "google/gemma-4-26b-a4b" else os.environ.get("COG_EVAL_MODEL", "e4b")
         effective_base_url = args.kernel_url
+        lms_model = os.environ.get("LMS_CHAT_MODEL", "f29de68cb284ca208446e647b339569935025ef3")
         print(f"==> Dispatch mode: kernel @ {effective_base_url}")
-        client: LMStudioAgenticClient | KernelMCPClient = KernelMCPClient(
+        client: LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient = KernelMCPClient(
             base_url=effective_base_url,
             timeout=180.0,
         )
+        # Phase 2: spin up ChatCompletionsClient for TD non-baseline trials
+        if token:
+            print(f"==> TD axis: ChatCompletionsClient @ {args.base_url} (model={lms_model})")
+            chat_client = ChatCompletionsClient(
+                base_url=args.base_url,
+                api_token=token,
+                kernel_url=effective_base_url,
+                timeout=180.0,
+            )
+        else:
+            print(
+                "==> Warning: LMS_API_TOKEN not set — TD non-baseline trials will "
+                "fall back to baseline descriptions (td_wired=False).",
+                file=sys.stderr,
+            )
+    elif args.dispatch_mode == "chat":
+        # Chat completions dispatch: all trials via LMS /v1/chat/completions
+        model = args.model if args.model != "google/gemma-4-26b-a4b" else os.environ.get(
+            "LMS_CHAT_MODEL", "f29de68cb284ca208446e647b339569935025ef3"
+        )
+        effective_base_url = args.base_url
+        if not token:
+            print(
+                "error: LMS_API_TOKEN is empty. Paste your LM Studio API token into "
+                "evals/.env (or export it) and re-run.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"==> Dispatch mode: chat @ {effective_base_url}")
+        client = ChatCompletionsClient(
+            base_url=effective_base_url,
+            api_token=token,
+            kernel_url=args.kernel_url,
+            timeout=180.0,
+        )
+        # chat_client IS client for this mode — no separate instance needed
+        chat_client = client  # type: ignore[assignment]
     else:
         # LMS dispatch: legacy /api/v1/chat plugin path
         model = args.model
         effective_base_url = args.base_url
-        token = os.environ.get("LMS_API_TOKEN", "").strip()
         if not token:
             print(
                 "error: LMS_API_TOKEN is empty. Paste your LM Studio API token into "
@@ -491,6 +583,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"==> Dispatch mode: lms @ {effective_base_url}")
         client = LMStudioAgenticClient(base_url=effective_base_url, api_token=token)
+
+    clients_to_close: list[Any] = [client]
+    if chat_client is not None and chat_client is not client:
+        clients_to_close.append(chat_client)
 
     try:
         _, summary = run_experiment(
@@ -502,6 +598,7 @@ def main(argv: list[str] | None = None) -> int:
             save_runs=args.save_runs,
             emit_cogblocks=not args.no_cogblocks,
             target_override=args.target,
+            chat_client=chat_client,
         )
     except Exception as e:
         print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -510,7 +607,8 @@ def main(argv: list[str] | None = None) -> int:
             traceback.print_exc()
         return 1
     finally:
-        client.close()
+        for c in clients_to_close:
+            c.close()
 
     return 0 if summary.failed == 0 else 1
 
