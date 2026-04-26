@@ -9,6 +9,10 @@ Usage:
     python -m evals.tournament.runner --experiment exp-001-anti-pattern-placement \\
         --model gemma4:e4b --dispatch-mode kernel --target laptop-kernel
 
+    # Claude baseline — kernel /v1/chat/completions → claude-code subprocess (Max OAuth):
+    python -m evals.tournament.runner --experiment exp-001-anti-pattern-placement \\
+        --dispatch-mode claude --target claude-code
+
     # LM Studio dispatch (legacy comparison path):
     python -m evals.tournament.runner --experiment exp-001-anti-pattern-placement \\
         --dispatch-mode lms --target laptop-lms
@@ -22,6 +26,20 @@ Phase 2: TD overrides are wired via ChatCompletionsClient (client_chat.py).
 Trials with a non-baseline TD variant route to LMS /v1/chat/completions with
 per-trial tool-description overrides applied. Baseline TD trials continue
 through KernelMCPClient (cog_dispatch_to_harness).
+
+Claude baseline dispatch (--dispatch-mode claude) — ROUTING CONSTRAINT:
+The kernel's claude-code provider is agentic-native. It spawns `claude -p`
+subprocesses that use Claude's own native MCP context to answer. The tools[]
+array sent in /v1/chat/completions is NOT forwarded to the subprocess — Claude
+answers from its existing MCP session (coherent, correct answers) without
+recording explicit tool_calls in the chat response. This means rubric checks
+that require tool_calls[] will always FAIL in claude mode.
+
+Implication: claude-code trial results measure answer quality (content_contains_*
+rubrics) but NOT tool-call compliance (expected_tools, first_tool_one_of). To
+get tool_call traces from Claude, use cog_dispatch_to_harness (kernel mode) with
+model=sonnet, which will route through claude-code and record tool calls in the
+kernel ledger. See feat/claude-baseline-target PR for full analysis.
 """
 
 from __future__ import annotations
@@ -45,6 +63,7 @@ from evals.harness.client import AgenticResult, LMStudioAgenticClient, ToolCall
 from evals.harness.scoring import Verdict, score
 from evals.tournament.client_kernel import KernelMCPClient
 from evals.tournament.client_chat import ChatCompletionsClient
+from evals.tournament.client_claudecode import ClaudeCodeClient
 from evals.reports.data import RunSummary, TrialRecord, save_trial_jsonl
 from evals.reports.html import render_html
 from evals.reports.md import render_markdown
@@ -118,7 +137,7 @@ def _is_td_nonbaseline(spec: TrialSpec) -> bool:
 
 def _run_trial(
     spec: TrialSpec,
-    client: LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient,
+    client: LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient | ClaudeCodeClient,
     model: str,
     plugin_ids: list[str],
     chat_client: ChatCompletionsClient | None = None,
@@ -193,7 +212,15 @@ def _run_trial(
             return result, verdict
 
     # Route: kernel dispatch (baseline TD or no TD axis)
-    if isinstance(client, KernelMCPClient):
+    if isinstance(client, ClaudeCodeClient):
+        # Claude baseline — kernel /v1/chat/completions → claude-code subprocess (Max OAuth).
+        # No API key; no temperature override; N=1. TD overrides not applied for baseline.
+        result = client.dispatch(
+            task=prompt,
+            system_prompt=sp_text,
+            max_tokens=max_tokens,
+        )
+    elif isinstance(client, KernelMCPClient):
         result = client.dispatch(
             task=prompt,
             system_prompt=sp_text,
@@ -268,7 +295,7 @@ def _make_trial_record(
 
 def run_experiment(
     experiment_id: str,
-    client: LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient,
+    client: LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient | ClaudeCodeClient,
     model: str,
     plugin_ids: list[str],
     base_url: str,
@@ -456,13 +483,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--dispatch-mode",
-        choices=["kernel", "lms", "chat"],
+        choices=["kernel", "lms", "chat", "claude"],
         default="kernel",
         help=(
             "Dispatch backend. 'kernel' (default): routes via cog_dispatch_to_harness "
             "against http://localhost:6931/mcp — kernel owns inference + tool execution. "
             "'lms': routes via LM Studio /api/v1/chat plugin endpoint (comparison/regression path). "
-            "'chat': routes all trials via LMS /v1/chat/completions (TD axis always active)."
+            "'chat': routes all trials via LMS /v1/chat/completions (TD axis always active). "
+            "'claude': routes via kernel /v1/chat/completions with model=sonnet — uses the "
+            "host claude-code subprocess provider (Claude Max OAuth, zero incremental cost). "
+            "NO Anthropic API key required or used."
         ),
     )
     parser.add_argument(
@@ -522,14 +552,32 @@ def main(argv: list[str] | None = None) -> int:
     # Build the inference client
     chat_client: ChatCompletionsClient | None = None
 
-    if args.dispatch_mode == "kernel":
+    if args.dispatch_mode == "claude":
+        # Claude baseline: kernel /v1/chat/completions → claude-code subprocess.
+        # Uses host Claude Max subscription via OAuth keychain — NO API key needed.
+        # No LMS_API_TOKEN check — the kernel handles auth internally.
+        model = "sonnet"  # kernel router resolves this to claude-code provider
+        effective_base_url = args.kernel_url
+        print(
+            f"==> Dispatch mode: claude (kernel claude-code provider @ {effective_base_url})"
+        )
+        print(
+            "    Auth: Claude Max OAuth (keychain) — no ANTHROPIC_API_KEY used"
+        )
+        client: (
+            LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient | ClaudeCodeClient
+        ) = ClaudeCodeClient(
+            kernel_url=effective_base_url,
+            timeout=180.0,
+        )
+    elif args.dispatch_mode == "kernel":
         # Kernel dispatch: cog_dispatch_to_harness via MCP session
         # Model default changes to e4b for kernel mode (Ollama, not LMS)
         model = args.model if args.model != "google/gemma-4-26b-a4b" else os.environ.get("COG_EVAL_MODEL", "e4b")
         effective_base_url = args.kernel_url
         lms_model = os.environ.get("LMS_CHAT_MODEL", "f29de68cb284ca208446e647b339569935025ef3")
         print(f"==> Dispatch mode: kernel @ {effective_base_url}")
-        client: LMStudioAgenticClient | KernelMCPClient | ChatCompletionsClient = KernelMCPClient(
+        client = KernelMCPClient(
             base_url=effective_base_url,
             timeout=180.0,
         )
