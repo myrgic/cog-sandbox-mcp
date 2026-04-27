@@ -232,7 +232,7 @@ class KernelMCPClient:
         model: str = "e4b",
         iss: str | None = None,
         sub: str | None = None,
-        timeout_seconds: int = 60,
+        timeout_seconds: int = 240,
         no_tools: bool = False,
     ) -> AgenticResult:
         """Dispatch one trial via cog_dispatch_to_harness.
