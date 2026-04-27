@@ -245,7 +245,7 @@ def _run_trial(
             model=model,
             iss="tournament",
             sub=spec.variant_ids.get("system_prompt", spec.experiment_id),
-            timeout_seconds=max(60, max_tokens // 10),
+            timeout_seconds=max(240, max_tokens // 10),
             no_tools=parametric_mode,
         )
     elif isinstance(client, ChatCompletionsClient):
@@ -617,7 +617,7 @@ def main(argv: list[str] | None = None) -> int:
         # Claude baseline: kernel /v1/chat/completions → claude-code subprocess.
         # Uses host Claude Max subscription via OAuth keychain — NO API key needed.
         # No LMS_API_TOKEN check — the kernel handles auth internally.
-        model = "sonnet"  # kernel router resolves this to claude-code provider
+        model = args.claude_model  # kernel router resolves this to claude-code provider
         effective_base_url = args.kernel_url
         print(
             f"==> Dispatch mode: claude (kernel claude-code provider @ {effective_base_url})"
