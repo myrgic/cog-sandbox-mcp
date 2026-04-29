@@ -63,7 +63,7 @@ from evals.harness.client import AgenticResult, LMStudioAgenticClient, ToolCall
 from evals.harness.scoring import Verdict, score
 from evals.tournament.client_kernel import KernelMCPClient
 from evals.tournament.client_chat import ChatCompletionsClient
-from evals.tournament.client_claudecode import ClaudeCodeClient
+from evals.tournament.client_claudecode import CLAUDE_CODE_MODEL, ClaudeCodeClient
 from evals.reports.data import RunSummary, TrialRecord, save_trial_jsonl
 from evals.reports.html import render_html
 from evals.reports.md import render_markdown
@@ -556,7 +556,14 @@ def main(argv: list[str] | None = None) -> int:
         # Claude baseline: kernel /v1/chat/completions → claude-code subprocess.
         # Uses host Claude Max subscription via OAuth keychain — NO API key needed.
         # No LMS_API_TOKEN check — the kernel handles auth internally.
-        model = "sonnet"  # kernel router resolves this to claude-code provider
+        # Forward args.model when set so --model haiku / opus etc. takes effect.
+        # Falls back to the claude-code provider's default (sonnet) when args.model
+        # is the global gemma sentinel default (i.e. user didn't override on CLI).
+        model = (
+            args.model
+            if args.model and args.model != "google/gemma-4-26b-a4b"
+            else CLAUDE_CODE_MODEL
+        )
         effective_base_url = args.kernel_url
         print(
             f"==> Dispatch mode: claude (kernel claude-code provider @ {effective_base_url})"
