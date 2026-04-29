@@ -1,6 +1,6 @@
 # Handoff Protocol
 
-_Version 0.2 — kernel-native hybrid (2026-04-22)._
+_Version 0.2.1 — participant_type discriminant (2026-04-22)._
 
 Spec for session identity, presence, and handoff events over the CogOS bus. Implemented in two complementary MCP surfaces (see §Implementation: two MCP surfaces):
 
@@ -74,10 +74,36 @@ First event a session emits on connection. Announces presence.
     "started_at": "2026-04-21T10:00:00Z",
     "model": "claude-opus-4-6",
     "role": "manager",
-    "task": "coordinating wave 2 of cross-session MCP rollout"
+    "task": "coordinating wave 2 of cross-session MCP rollout",
+    "participant_type": "agent"
   }
 }
 ```
+
+`participant_type` is an optional discriminant, one of `"agent" | "user" | "provider"`. It defaults to `"agent"` on the wire (and is omitted from the payload by the bridge when the default applies, preserving byte-compat with pre-v0.2.1 emissions). Values:
+
+- `"agent"` — an autonomous session (Claude Code, sub-agent, worker). The canonical case; this is what every session was before v0.2.1.
+- `"user"` — a human-driven session (a person at a REPL or CLI emitting as themselves).
+- `"provider"` — a **channel provider** per the [channel-provider RFC](cog://mem/semantic/designs/channel-provider-interface): mod3 (audio), discord (text-platform), repl / watch-TUI (terminal), gateway (OpenAI-compat). Providers use the same `cogos_session_register` primitive agents use and typically carry a `metadata` sub-object with `provider_id` and `kinds` so consumers can filter:
+
+```json
+{
+  "type": "session.register",
+  "payload": {
+    "session_id": "slowbro-laptop-mod3-provider",
+    "workspace": "/Users/slowbro/workspaces/cogos-dev/mod3",
+    "role": "audio-provider",
+    "task": "mediating voice-room-primary",
+    "participant_type": "provider",
+    "metadata": {
+      "provider_id": "mod3",
+      "kinds": ["audio"]
+    }
+  }
+}
+```
+
+Roster/presence consumers that do not care about the distinction can keep treating every row uniformly; consumers that do (e.g. "do not offer handoffs to providers") filter on `participant_type`.
 
 ### `session.heartbeat`
 
@@ -255,7 +281,7 @@ Each protocol operation is served by a pair of MCP tools — the Python bridge t
 
 | Bridge tool (`cogos_*`) | Kernel tool (`cog_*`) | HTTP route | Event emitted |
 |---|---|---|---|
-| `cogos_session_register(session_id, workspace, role, task)` | `cog_register_session` | `POST /v1/sessions/register` | `session.register` |
+| `cogos_session_register(session_id, workspace, role, task, participant_type?, metadata?)` | `cog_register_session` | `POST /v1/sessions/register` | `session.register` |
 | `cogos_session_heartbeat(session_id, status, context_usage, current_task)` | `cog_heartbeat_session` | `POST /v1/sessions/{id}/heartbeat` | `session.heartbeat` |
 | `cogos_session_end(session_id, reason, handoff_id?)` | `cog_end_session` | `POST /v1/sessions/{id}/end` | `session.end` |
 | `cogos_sessions_list(active_within_seconds, include_ended?)` | `cog_list_sessions` | `GET /v1/sessions/presence` | — (read) |
@@ -325,7 +351,26 @@ Every rejected claim also emits a `handoff.claim_rejected` event to `bus_handoff
 
 ## Versioning
 
-### v0.2 (2026-04-22) — current
+### v0.2.1 (2026-04-22) — current
+
+- `cogos_session_register` and the `session.register` payload now accept an
+  optional `participant_type` discriminant (`"agent" | "user" | "provider"`,
+  default `"agent"`) and an optional free-form `metadata` dict. Enables the
+  channel-provider RFC
+  ([cog://mem/semantic/designs/channel-provider-interface](cog://mem/semantic/designs/channel-provider-interface))
+  to register providers (mod3, discord, repl, gateway, watch-TUI) through the
+  same primitive agents use.
+- Fully back-compat: the bridge omits `participant_type` from the wire when
+  it equals the `"agent"` default, so the kernel sees the identical payload
+  existing callers have been sending. Existing agent callers do not need to
+  change anything.
+- Kernel-side: if the kernel accepts/ignores unknown keys (the v0.2 contract),
+  this is purely a bridge-side change. If the kernel strictly validates the
+  payload shape, `participant_type` and `metadata` need to be added to the
+  accepted keys on `POST /v1/sessions/register`. Flagged in the task report;
+  not changed here.
+
+### v0.2 (2026-04-22)
 
 - Kernel-native hybrid landed. Session & handoff registries now live in the kernel (`internal/engine/sessions.go`, `serve_sessions_mgmt.go`).
 - Atomic claim enforced server-side (`409 already_claimed` / `409 ttl_expired` / `404 offer_not_found`).

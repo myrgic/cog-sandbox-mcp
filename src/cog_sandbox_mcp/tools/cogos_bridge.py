@@ -452,6 +452,16 @@ def _kernel_get(path: str, params: dict[str, Any] | None, bus_id: str) -> Any:
         }
 
 
+# Legal values for the ``participant_type`` discriminant on session.register.
+# ``agent`` and ``user`` cover the original session-handoff substrate;
+# ``provider`` was added for the channel-provider RFC (see
+# cog://mem/semantic/designs/channel-provider-interface) — channel providers
+# (mod3, discord, repl, gateway, watch-TUI) register themselves via the same
+# primitive agents use so the kernel's session registry is the single source
+# of truth for "who's on the bus," regardless of what kind of participant.
+_PARTICIPANT_TYPES: tuple[str, ...] = ("agent", "user", "provider")
+
+
 def cogos_session_register(
     session_id: str,
     workspace: str,
@@ -459,6 +469,8 @@ def cogos_session_register(
     task: str,
     model: str | None = None,
     hostname: str | None = None,
+    participant_type: str = "agent",
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Announce a session's presence on the kernel-native session registry.
 
@@ -477,25 +489,55 @@ def cogos_session_register(
     construct one per the protocol (``<hostname>-<workspace-slug>-<role-or-
     ulid>``) — do not invent arbitrary identifiers; ask the user if unsure.
 
+    Channel providers use the same primitive: set ``participant_type="provider"``
+    and pass ``metadata={"provider_id": ..., "kinds": [...]}`` per the
+    channel-provider RFC (cog://mem/semantic/designs/channel-provider-interface).
+    The kernel registry then distinguishes providers from agents/users for the
+    consumers (rosters, handoff targeting) that care about the distinction.
+
     Arguments:
-      session_id: stable identifier for this session (ASCII, lowercase,
-                  ``[a-z0-9-]``, at least two hyphen-separated components).
-                  Used as ``from`` on every emit from this session.
-      workspace:  absolute path to the working directory / repo root this
-                  session is operating in.
-      role:       human-meaningful role label ("manager", "worker-1",
-                  "researcher"). Free-form string.
-      task:       one-line description of what this session is doing.
-      model:      optional model identifier (e.g. "claude-opus-4-7"). Helpful
-                  for cross-session triage; omit if unknown.
-      hostname:   optional hostname; recommended when multiple machines
-                  participate in the same bus.
+      session_id:       stable identifier for this session (ASCII, lowercase,
+                        ``[a-z0-9-]``, at least two hyphen-separated
+                        components). Used as ``from`` on every emit from this
+                        session.
+      workspace:        absolute path to the working directory / repo root this
+                        session is operating in.
+      role:             human-meaningful role label ("manager", "worker-1",
+                        "researcher", "audio-provider"). Free-form string.
+      task:             one-line description of what this session is doing.
+      model:            optional model identifier (e.g. "claude-opus-4-7").
+                        Helpful for cross-session triage; omit if unknown.
+      hostname:         optional hostname; recommended when multiple machines
+                        participate in the same bus.
+      participant_type: one of ``"agent" | "user" | "provider"``. Defaults to
+                        ``"agent"`` for back-compat with existing callers.
+                        Use ``"provider"`` for channel-provider registrations
+                        (mod3, discord, repl, gateway, watch-TUI); use
+                        ``"user"`` for human-driven sessions. Client-side
+                        validation rejects unknown values with the structured
+                        error envelope; the kernel re-validates.
+      metadata:         optional free-form dict passed through to the kernel
+                        verbatim. Used by providers to carry ``provider_id``
+                        and ``kinds`` (e.g. ``{"provider_id": "mod3",
+                        "kinds": ["audio"]}``) per the channel-provider RFC.
+                        Ignored when empty.
 
     Contract: returns the kernel's JSON body on success (includes ``ok``,
     ``seq``, ``hash``, ``created``, and the canonical ``session`` row). On
     HTTP 4xx/5xx or transport failure, returns ``{"success": False, "error":
     ..., "bus_id": "bus_sessions"}`` — same never-raise contract as before.
+    Client-side validation of ``participant_type`` short-circuits with the
+    same envelope (no kernel round-trip on an obvious client bug).
     """
+    if participant_type not in _PARTICIPANT_TYPES:
+        return {
+            "success": False,
+            "error": (
+                f"participant_type must be one of {list(_PARTICIPANT_TYPES)}, "
+                f"got {participant_type!r}"
+            ),
+            "bus_id": BUS_SESSIONS,
+        }
     payload: dict[str, Any] = {
         "session_id": session_id,
         "workspace": workspace,
@@ -506,6 +548,15 @@ def cogos_session_register(
         payload["model"] = model
     if hostname is not None:
         payload["hostname"] = hostname
+    # Only include ``participant_type`` on the wire when it differs from the
+    # default. This preserves byte-for-byte compatibility with the v0.2 kernel
+    # for existing agent callers — the kernel sees the same payload it always
+    # has. Provider registrations and explicit user declarations travel with
+    # the field.
+    if participant_type != "agent":
+        payload["participant_type"] = participant_type
+    if metadata:
+        payload["metadata"] = dict(metadata)
     return _kernel_post("/v1/sessions/register", payload, BUS_SESSIONS)
 
 
@@ -993,6 +1044,352 @@ def cogos_handoff_complete(
     )
 
 
+def _mod3_base_url() -> str:
+    """Resolve the mod3 HTTP service base URL.
+
+    Defaults to ``http://localhost:7860`` (mod3's canonical dev port; see
+    mod3/server.py default ``--port 7860``). Override with ``MOD3_URL`` to
+    point at a non-local or non-default deployment.
+    """
+    raw = os.environ.get("MOD3_URL", "http://localhost:7860").strip()
+    return raw.rstrip("/") or "http://localhost:7860"
+
+
+def _mod3_register_session(
+    session_id: str,
+    participant_id: str,
+    participant_type: str,
+    preferred_voice: str | None,
+    channel_id: str,
+    timeout_s: float = 2.0,
+) -> dict[str, Any]:
+    """Best-effort POST to mod3's ``/v1/sessions/register`` route.
+
+    Per ADR-082 and the channel-provider RFC, when a channel's provider is
+    ``mod3`` the session should also register with mod3 so it gets a voice
+    assignment and is visible to the global serializer. This is non-fatal —
+    if mod3 is not running, the bus-side attendance still succeeds.
+
+    Returns a structured dict:
+    - ``{"registered": True, "response": <body>}`` on 2xx
+    - ``{"registered": False, "warning": "..."}`` on failure (non-fatal)
+
+    Tight timeout (2s default) so a down mod3 doesn't stall the join call.
+    """
+    url = f"{_mod3_base_url()}/v1/sessions/register"
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "participant_id": participant_id,
+        "participant_type": participant_type,
+        "channel_id": channel_id,
+    }
+    if preferred_voice:
+        payload["preferred_voice"] = preferred_voice
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {"_raw": body}
+        return {"registered": True, "response": parsed}
+    except urllib.error.HTTPError as e:
+        detail = f"HTTP {e.code} {e.reason}"
+        return {"registered": False, "warning": f"mod3 rejected registration: {detail}"}
+    except urllib.error.URLError as e:
+        return {
+            "registered": False,
+            "warning": f"mod3 unreachable at {url}: {type(e).__name__}: {e}",
+        }
+    except Exception as e:
+        return {
+            "registered": False,
+            "warning": f"mod3 register failed: {type(e).__name__}: {e}",
+        }
+
+
+def _session_is_registered(session_id: str) -> tuple[bool, str | None]:
+    """Lightweight check against the kernel presence route.
+
+    Returns ``(True, None)`` if the session_id appears in the presence roster,
+    ``(False, reason)`` otherwise. On transport failure returns ``(False,
+    reason)`` — join callers treat that as "cannot verify, bail with a
+    structured error" rather than silently succeeding against a sessionless
+    bus.
+    """
+    body = _kernel_get(
+        "/v1/sessions/presence",
+        {"active_within_seconds": 3600, "include_ended": "false"},
+        BUS_SESSIONS,
+    )
+    if isinstance(body, dict) and body.get("success") is False:
+        return False, body.get("error") or "presence lookup failed"
+    if not isinstance(body, dict):
+        return False, f"unexpected presence response shape: {type(body).__name__}"
+    rows = body.get("sessions")
+    if not isinstance(rows, list):
+        return False, "presence response missing 'sessions' list"
+    for row in rows:
+        if isinstance(row, dict) and row.get("session_id") == session_id:
+            return True, None
+    return False, f"session {session_id!r} not registered"
+
+
+# Legal values for ``participant_type`` on ``cogos_channel_join``. Kept in
+# sync with ``_PARTICIPANT_TYPES`` above — a channel attendant can be any
+# valid participant (an agent driving a Claude Code session, a human user
+# joining a voice room, or another provider peering in).
+_CHANNEL_PARTICIPANT_TYPES: tuple[str, ...] = ("agent", "user", "provider")
+
+
+def cogos_channel_join(
+    session_id: str,
+    channel_id: str,
+    participant_id: str,
+    participant_type: str = "agent",
+    preferred_voice: str | None = None,
+) -> dict[str, Any]:
+    """Join a channel (attend it) for a registered session.
+
+    Records attendance as a ``participant.joined`` event on the channel's
+    attendance topic ``channel.<channel_id>.attendance`` via the kernel's
+    ``/v1/bus/send`` route. Per the channel-provider RFC
+    (cog://mem/semantic/designs/channel-provider-interface § Bus topics per
+    channel), each channel owns a namespace ``channel.<id>.<event-kind>``;
+    attendance is the first of five event kinds defined on that namespace.
+
+    CALL THIS WHEN a Claude Code session (or any registered participant)
+    wants to attend an existing channel — speak into it, receive egress
+    events, observe barge-in. This does NOT create the channel cogdoc itself
+    (that is a separate, intentional act handled by the provider). If the
+    channel's cogdoc doesn't exist yet, the attendance event still lands on
+    the bus, but the channel is effectively dormant until a provider stands
+    it up.
+
+    Side effect: if ``MOD3_URL`` points at a reachable mod3 and the channel's
+    provider is mod3 (the caller signals this implicitly by attending an
+    audio-kind channel; this tool attempts the call unconditionally for
+    simplicity), also calls mod3's ``/v1/sessions/register`` to mint a voice
+    assignment and register with the global serializer. That call is
+    best-effort — if mod3 is down, the attendance event still succeeds and
+    a ``mod3_warning`` field appears in the response so the caller knows
+    mod3 didn't pick up.
+
+    Arguments:
+      session_id:       the Claude Code (or other) session id, already
+                        registered via ``cogos_session_register``. Used as
+                        ``from`` on the attendance event AND as the session
+                        key mod3 uses for voice assignment. Client-side
+                        verifies via a presence lookup before emitting.
+      channel_id:       the channel slug (ASCII lowercase kebab per the RFC
+                        frontmatter schema). Examples: ``voice-room-primary``,
+                        ``cog-lab-room``.
+      participant_id:   the participant identity for this attendant. For
+                        agents this is typically the identity card name
+                        (``cog``, ``sandy``); for users, the user handle
+                        (``slowbro``); for providers, the provider id.
+      participant_type: one of ``"agent" | "user" | "provider"``. Defaults
+                        to ``"agent"`` since the most common caller is a
+                        Claude Code session. Client-side validation rejects
+                        unknown values with the structured error envelope.
+      preferred_voice:  optional voice-preset hint for audio channels
+                        (e.g. Kokoro voice id ``bm_lewis``). Passed through
+                        to mod3's voice assignment; ignored for non-audio
+                        channels.
+
+    Contract: on success returns ``{"success": True, "channel_id": ...,
+    "attendance_event_seq": <int>, "participant_id": ..., "participant_type":
+    ..., "joined_at": <iso8601>, "mod3": {...}}``. The ``mod3`` subfield
+    reports whether mod3 registration succeeded — ``{"registered": True,
+    "response": ...}`` or ``{"registered": False, "warning": "..."}``. On
+    failure (session not registered, transport error, unknown participant
+    type, etc.) returns ``{"success": False, "error": ..., "bus_id":
+    "channel.<channel_id>.attendance"}`` — same never-raise contract as the
+    other bridge tools.
+    """
+    bus_id = f"channel.{channel_id}.attendance"
+
+    # Client-side validation first so obvious client bugs never round-trip.
+    if participant_type not in _CHANNEL_PARTICIPANT_TYPES:
+        return {
+            "success": False,
+            "error": (
+                f"participant_type must be one of "
+                f"{list(_CHANNEL_PARTICIPANT_TYPES)}, got {participant_type!r}"
+            ),
+            "bus_id": bus_id,
+        }
+    if not isinstance(channel_id, str) or not channel_id.strip():
+        return {
+            "success": False,
+            "error": "channel_id must be a non-empty string",
+            "bus_id": bus_id,
+        }
+    if not isinstance(session_id, str) or not session_id.strip():
+        return {
+            "success": False,
+            "error": "session_id must be a non-empty string",
+            "bus_id": bus_id,
+        }
+    if not isinstance(participant_id, str) or not participant_id.strip():
+        return {
+            "success": False,
+            "error": "participant_id must be a non-empty string",
+            "bus_id": bus_id,
+        }
+
+    # Verify the session exists on the kernel registry. Prevents attendance
+    # events from floating in without a corresponding session record — which
+    # would confuse rosters, handoff targeting, and the eventual EMA
+    # attendance weighting (§ Attendance as an EMA in the RFC).
+    registered, reason = _session_is_registered(session_id)
+    if not registered:
+        return {
+            "success": False,
+            "error": (
+                f"session {session_id!r} is not registered on the kernel "
+                f"(reason: {reason}); call cogos_session_register first"
+            ),
+            "bus_id": bus_id,
+        }
+
+    joined_at = _utc_now_iso()
+    payload_body: dict[str, Any] = {
+        "session_id": session_id,
+        "participant_id": participant_id,
+        "participant_type": participant_type,
+        "joined_at": joined_at,
+    }
+    if preferred_voice is not None:
+        payload_body["preferred_voice"] = preferred_voice
+
+    emit_result = _kernel_post(
+        "/v1/bus/send",
+        {
+            "bus_id": bus_id,
+            "message": json.dumps(payload_body),
+            "from": participant_id,
+            "type": "participant.joined",
+        },
+        bus_id,
+    )
+    if isinstance(emit_result, dict) and emit_result.get("success") is False:
+        return emit_result
+
+    attendance_event_seq: Any = None
+    if isinstance(emit_result, dict):
+        attendance_event_seq = emit_result.get("seq")
+
+    # Best-effort mod3 registration — non-fatal. See _mod3_register_session
+    # for the contract. Always included in the response so callers can see
+    # whether voice assignment succeeded even when the bus side did.
+    mod3_status = _mod3_register_session(
+        session_id=session_id,
+        participant_id=participant_id,
+        participant_type=participant_type,
+        preferred_voice=preferred_voice,
+        channel_id=channel_id,
+    )
+
+    return {
+        "success": True,
+        "channel_id": channel_id,
+        "attendance_event_seq": attendance_event_seq,
+        "participant_id": participant_id,
+        "participant_type": participant_type,
+        "joined_at": joined_at,
+        "bus_id": bus_id,
+        "mod3": mod3_status,
+    }
+
+
+def cogos_channel_leave(
+    session_id: str,
+    channel_id: str,
+    participant_id: str | None = None,
+) -> dict[str, Any]:
+    """Leave a channel by emitting ``participant.left`` on its attendance topic.
+
+    Symmetric counterpart to ``cogos_channel_join``. Emits a
+    ``participant.left`` event on ``channel.<channel_id>.attendance`` so
+    roster queries and attendance-EMA consumers see the departure in order.
+
+    CALL THIS WHEN a Claude Code session is winding down, the user asks the
+    agent to leave the channel, or the session is rotating attendance (leave
+    old, join new). Pair with ``cogos_session_end`` if the session itself is
+    ending. Not calling leave is not fatal — attendance decays via EMA — but
+    explicit leave makes rosters crisp and avoids ambiguous "is X still
+    here?" queries.
+
+    Arguments:
+      session_id:     the session id that is leaving. Must match the one
+                      used on the corresponding join.
+      channel_id:     the channel slug to leave.
+      participant_id: optional — used as ``from`` on the emitted event.
+                      Defaults to the session_id when omitted so the event
+                      is still attributable.
+
+    Contract: returns ``{"success": True, "channel_id": ..., "left_at":
+    ..., "departure_event_seq": <int>}`` on success, structured
+    ``{"success": False, "error": ..., "bus_id":
+    "channel.<channel_id>.attendance"}`` on failure.
+    """
+    bus_id = f"channel.{channel_id}.attendance"
+
+    if not isinstance(channel_id, str) or not channel_id.strip():
+        return {
+            "success": False,
+            "error": "channel_id must be a non-empty string",
+            "bus_id": bus_id,
+        }
+    if not isinstance(session_id, str) or not session_id.strip():
+        return {
+            "success": False,
+            "error": "session_id must be a non-empty string",
+            "bus_id": bus_id,
+        }
+
+    sender = participant_id if participant_id else session_id
+    left_at = _utc_now_iso()
+    payload_body: dict[str, Any] = {
+        "session_id": session_id,
+        "participant_id": participant_id,
+        "left_at": left_at,
+    }
+
+    emit_result = _kernel_post(
+        "/v1/bus/send",
+        {
+            "bus_id": bus_id,
+            "message": json.dumps(payload_body),
+            "from": sender,
+            "type": "participant.left",
+        },
+        bus_id,
+    )
+    if isinstance(emit_result, dict) and emit_result.get("success") is False:
+        return emit_result
+
+    departure_event_seq: Any = None
+    if isinstance(emit_result, dict):
+        departure_event_seq = emit_result.get("seq")
+
+    return {
+        "success": True,
+        "channel_id": channel_id,
+        "left_at": left_at,
+        "departure_event_seq": departure_event_seq,
+        "bus_id": bus_id,
+    }
+
+
 def register(mcp: FastMCP) -> None:
     """Register bridge tools with the MCP server.
 
@@ -1074,3 +1471,15 @@ def register(mcp: FastMCP) -> None:
             readOnlyHint=False, idempotentHint=False, openWorldHint=True
         ),
     )(cogos_handoff_complete)
+    mcp.tool(
+        title="Join a Cog OS channel",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_channel_join)
+    mcp.tool(
+        title="Leave a Cog OS channel",
+        annotations=ToolAnnotations(
+            readOnlyHint=False, idempotentHint=False, openWorldHint=True
+        ),
+    )(cogos_channel_leave)

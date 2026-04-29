@@ -159,6 +159,129 @@ def test_session_register_never_raises_on_http_error(
     assert result["bus_id"] == "bus_sessions"
 
 
+def test_session_register_default_participant_type_is_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Back-compat invariant: when participant_type is left at the "agent"
+    default, it must NOT appear on the wire. The kernel (and any downstream
+    reading bus_sessions directly) should see the exact byte-for-byte payload
+    existing agent callers have always sent."""
+    from cog_sandbox_mcp.tools import cogos_bridge
+
+    calls = _stub_post(monkeypatch)
+    cogos_bridge.cogos_session_register(
+        session_id="host-ws-role", workspace="/a", role="r", task="t"
+    )
+    p = calls[0]["payload"]
+    assert "participant_type" not in p
+    assert "metadata" not in p
+
+
+def test_session_register_explicit_agent_also_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit participant_type="agent" is treated the same as the default:
+    omitted from the wire so the kernel's registered payload is identical
+    across "default agent" and "explicit agent" callers."""
+    from cog_sandbox_mcp.tools import cogos_bridge
+
+    calls = _stub_post(monkeypatch)
+    cogos_bridge.cogos_session_register(
+        session_id="host-ws-role",
+        workspace="/a",
+        role="r",
+        task="t",
+        participant_type="agent",
+    )
+    assert "participant_type" not in calls[0]["payload"]
+
+
+def test_session_register_provider_includes_participant_type_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Channel-provider RFC shape: participant_type="provider" plus metadata
+    carrying provider_id and kinds travel on the wire so the kernel's session
+    registry can distinguish providers from agents."""
+    from cog_sandbox_mcp.tools import cogos_bridge
+
+    calls = _stub_post(monkeypatch)
+    result = cogos_bridge.cogos_session_register(
+        session_id="slowbro-laptop-mod3-provider",
+        workspace="/Users/slowbro/workspaces/cogos-dev/mod3",
+        role="audio-provider",
+        task="mediating voice-room-primary",
+        participant_type="provider",
+        metadata={"provider_id": "mod3", "kinds": ["audio"]},
+    )
+    assert result["ok"] is True
+    p = calls[0]["payload"]
+    assert p["participant_type"] == "provider"
+    assert p["metadata"] == {"provider_id": "mod3", "kinds": ["audio"]}
+    assert p["session_id"] == "slowbro-laptop-mod3-provider"
+
+
+def test_session_register_user_participant_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Human-driven sessions can declare participant_type="user" and it travels
+    on the wire (only the "agent" default is elided)."""
+    from cog_sandbox_mcp.tools import cogos_bridge
+
+    calls = _stub_post(monkeypatch)
+    cogos_bridge.cogos_session_register(
+        session_id="host-ws-chaz",
+        workspace="/a",
+        role="operator",
+        task="live REPL",
+        participant_type="user",
+    )
+    assert calls[0]["payload"]["participant_type"] == "user"
+
+
+def test_session_register_rejects_unknown_participant_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Client-side validation short-circuits with the never-raise envelope on
+    an obvious client bug (typo, unsupported value) — no kernel round-trip."""
+    from cog_sandbox_mcp.tools import cogos_bridge
+
+    calls = _stub_post(monkeypatch)
+    r = cogos_bridge.cogos_session_register(
+        session_id="host-ws-role",
+        workspace="/a",
+        role="r",
+        task="t",
+        participant_type="robot",
+    )
+    assert r["success"] is False
+    assert "participant_type" in r["error"]
+    assert "robot" in r["error"]
+    assert r["bus_id"] == "bus_sessions"
+    # No HTTP call should have been made on a client-side validation failure.
+    assert calls == []
+
+
+def test_session_register_empty_metadata_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty metadata dict (or None) is not serialized — keep the payload
+    minimal when there's nothing to say."""
+    from cog_sandbox_mcp.tools import cogos_bridge
+
+    calls = _stub_post(monkeypatch)
+    cogos_bridge.cogos_session_register(
+        session_id="host-ws-role",
+        workspace="/a",
+        role="r",
+        task="t",
+        participant_type="provider",
+        metadata={},
+    )
+    p = calls[0]["payload"]
+    assert "metadata" not in p
+    assert p["participant_type"] == "provider"
+
+
 # ---------- session.heartbeat ----------
 
 
