@@ -39,7 +39,7 @@ jobs:
       - name: Install package with dev extras
         run: uv pip install --system -e ".[dev]"
       - name: Run pytest
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ evals/tournament/tests/ evals/harness/tests/ -v --tb=short
 
   build:
     name: Build wheel
