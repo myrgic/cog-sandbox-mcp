@@ -17,3 +17,4 @@ evals/baseline.jsonl
 evals/*.jsonl
 evals/runs/
 evals/experiments/*.local.yaml
+.claude/
