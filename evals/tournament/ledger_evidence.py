@@ -44,6 +44,7 @@ Usage
 
 from __future__ import annotations
 
+import json as _json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -218,9 +219,6 @@ def _to_rfc3339(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-import json as _json
 
 
 def _unwrap_mcp_result(raw: Any) -> dict[str, Any]:
