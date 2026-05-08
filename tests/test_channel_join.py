@@ -97,7 +97,7 @@ def test_channel_join_rejects_unknown_participant_type(
     _disable_mod3(monkeypatch)
     _stub_post_and_get(monkeypatch, presence_sessions=[])
     r = cogos_bridge.cogos_channel_join(
-        session_id="slowbro-laptop-cog-manager",
+        session_id="dev-laptop-cog-manager",
         channel_id="voice-room-primary",
         participant_id="cog",
         participant_type="overlord",
@@ -116,7 +116,7 @@ def test_channel_join_rejects_blank_fields(
     _stub_post_and_get(monkeypatch, presence_sessions=[])
 
     r = cogos_bridge.cogos_channel_join(
-        session_id="slowbro-laptop-cog-manager",
+        session_id="dev-laptop-cog-manager",
         channel_id="",
         participant_id="cog",
     )
@@ -132,7 +132,7 @@ def test_channel_join_rejects_blank_fields(
     assert "session_id" in r["error"]
 
     r = cogos_bridge.cogos_channel_join(
-        session_id="slowbro-laptop-cog-manager",
+        session_id="dev-laptop-cog-manager",
         channel_id="voice-room-primary",
         participant_id="",
     )
@@ -156,7 +156,7 @@ def test_channel_join_fails_when_session_not_registered(
     # Empty presence list — session_id won't be found.
     post_calls, get_calls = _stub_post_and_get(monkeypatch, presence_sessions=[])
     r = cogos_bridge.cogos_channel_join(
-        session_id="slowbro-laptop-cog-manager",
+        session_id="dev-laptop-cog-manager",
         channel_id="voice-room-primary",
         participant_id="cog",
     )
@@ -183,11 +183,11 @@ def test_channel_join_emits_participant_joined_event(
     post_calls, _get_calls = _stub_post_and_get(
         monkeypatch,
         presence_sessions=[
-            {"session_id": "slowbro-laptop-cog-manager", "active": True},
+            {"session_id": "dev-laptop-cog-manager", "active": True},
         ],
     )
     r = cogos_bridge.cogos_channel_join(
-        session_id="slowbro-laptop-cog-manager",
+        session_id="dev-laptop-cog-manager",
         channel_id="voice-room-primary",
         participant_id="cog",
         participant_type="agent",
@@ -212,7 +212,7 @@ def test_channel_join_emits_participant_joined_event(
     assert payload["type"] == "participant.joined"
     # ``message`` is a JSON-encoded string per the /v1/bus/send contract.
     body = json.loads(payload["message"])
-    assert body["session_id"] == "slowbro-laptop-cog-manager"
+    assert body["session_id"] == "dev-laptop-cog-manager"
     assert body["participant_id"] == "cog"
     assert body["participant_type"] == "agent"
     assert body["preferred_voice"] == "bm_lewis"
@@ -421,7 +421,7 @@ def test_channel_leave_emits_participant_left_event(
 
     monkeypatch.setattr(cogos_bridge, "_http_post_json", fake_post)
     r = cogos_bridge.cogos_channel_leave(
-        session_id="slowbro-laptop-cog-manager",
+        session_id="dev-laptop-cog-manager",
         channel_id="voice-room-primary",
         participant_id="cog",
     )
@@ -439,7 +439,7 @@ def test_channel_leave_emits_participant_left_event(
     assert p["type"] == "participant.left"
     assert p["from"] == "cog"
     body = json.loads(p["message"])
-    assert body["session_id"] == "slowbro-laptop-cog-manager"
+    assert body["session_id"] == "dev-laptop-cog-manager"
     assert body["participant_id"] == "cog"
     assert body["left_at"] == r["left_at"]
 
@@ -462,10 +462,10 @@ def test_channel_leave_defaults_sender_to_session_id(
 
     monkeypatch.setattr(cogos_bridge, "_http_post_json", fake_post)
     cogos_bridge.cogos_channel_leave(
-        session_id="slowbro-laptop-cog-manager",
+        session_id="dev-laptop-cog-manager",
         channel_id="voice-room-primary",
     )
-    assert post_calls[0]["payload"]["from"] == "slowbro-laptop-cog-manager"
+    assert post_calls[0]["payload"]["from"] == "dev-laptop-cog-manager"
 
 
 def test_channel_leave_rejects_blank_fields(

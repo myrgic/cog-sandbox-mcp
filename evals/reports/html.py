@@ -4,8 +4,7 @@ Two-tab layout: Brief (narrative) + Data (matrix + per-trial drill-down).
 Pure CSS tabs via radio + label pattern. No JavaScript.
 Native <details>/<summary> for per-trial drill-down.
 
-CSS variables and .matrix-cell classes lifted from:
-  /Users/slowbro/workspaces/cog/.cog/docs/modality-bus-report.html lines 8-131
+CSS variables and .matrix-cell classes adapted from internal modality-bus-report styles.
 
 Brief tab loads from:
   brief.html (raw HTML) → brief.md (minimal markdown) → auto-generated default

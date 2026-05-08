@@ -14,6 +14,7 @@ Robust to missing files; logs warnings.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,9 +25,25 @@ import yaml
 log = logging.getLogger(__name__)
 
 # Default tournament cogdoc root under the cog workspace.
-# Can be overridden via COG_TOURNAMENT_ROOT env var or explicit argument.
+# Resolution order:
+#   1. COG_TOURNAMENT_ROOT env var (explicit override)
+#   2. $COGOS_WORKSPACE/.cog/mem/semantic/architecture/tournament
+#      where COGOS_WORKSPACE defaults to ~/workspaces/cog
 _DEFAULT_TOURNAMENT_ROOT = Path(
-    "/Users/slowbro/workspaces/cog/.cog/mem/semantic/architecture/tournament"
+    os.environ.get(
+        "COG_TOURNAMENT_ROOT",
+        os.path.join(
+            os.environ.get(
+                "COGOS_WORKSPACE",
+                os.path.join(os.path.expanduser("~"), "workspaces", "cog"),
+            ),
+            ".cog",
+            "mem",
+            "semantic",
+            "architecture",
+            "tournament",
+        ),
+    )
 )
 
 

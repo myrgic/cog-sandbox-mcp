@@ -10,8 +10,20 @@ focus on client-side payload fidelity and error passthrough.
 
 from __future__ import annotations
 
+import os
 import urllib.error
 from typing import Any
+
+# Neutral test fixtures — use env vars so CI can override without patching code.
+_TEST_WORKSPACE = os.environ.get("COGOS_WORKSPACE", "/tmp/test-cog-workspace")
+_TEST_MOD3_WORKSPACE = os.path.join(
+    os.environ.get(
+        "MYRGIC_REPOS_ROOT",
+        os.path.join(os.path.dirname(_TEST_WORKSPACE), "myrgic"),
+    ),
+    "mod3",
+)
+_TEST_HOSTNAME = os.environ.get("COGOS_TEST_HOSTNAME", "dev-laptop")
 
 import pytest
 
@@ -110,12 +122,12 @@ def test_session_register_calls_kernel_route(
 
     calls = _stub_post(monkeypatch)
     result = cogos_bridge.cogos_session_register(
-        session_id="slowbro-laptop-cog-manager",
-        workspace="/Users/slowbro/workspaces/cog",
+        session_id=f"{_TEST_HOSTNAME}-cog-manager",
+        workspace=_TEST_WORKSPACE,
         role="manager",
         task="coordinating wave 2",
         model="claude-opus-4-7",
-        hostname="slowbro-laptop",
+        hostname=_TEST_HOSTNAME,
     )
 
     assert result == {"ok": True, "seq": 1, "hash": "hash1"}
@@ -123,12 +135,12 @@ def test_session_register_calls_kernel_route(
     c = calls[0]
     assert c["path"] == "/v1/sessions/register"
     p = c["payload"]
-    assert p["session_id"] == "slowbro-laptop-cog-manager"
-    assert p["workspace"] == "/Users/slowbro/workspaces/cog"
+    assert p["session_id"] == f"{_TEST_HOSTNAME}-cog-manager"
+    assert p["workspace"] == _TEST_WORKSPACE
     assert p["role"] == "manager"
     assert p["task"] == "coordinating wave 2"
     assert p["model"] == "claude-opus-4-7"
-    assert p["hostname"] == "slowbro-laptop"
+    assert p["hostname"] == _TEST_HOSTNAME
 
 
 def test_session_register_omits_optional_fields(
@@ -206,8 +218,8 @@ def test_session_register_provider_includes_participant_type_and_metadata(
 
     calls = _stub_post(monkeypatch)
     result = cogos_bridge.cogos_session_register(
-        session_id="slowbro-laptop-mod3-provider",
-        workspace="/Users/slowbro/workspaces/cogos-dev/mod3",
+        session_id=f"{_TEST_HOSTNAME}-mod3-provider",
+        workspace=_TEST_MOD3_WORKSPACE,
         role="audio-provider",
         task="mediating voice-room-primary",
         participant_type="provider",
@@ -217,7 +229,7 @@ def test_session_register_provider_includes_participant_type_and_metadata(
     p = calls[0]["payload"]
     assert p["participant_type"] == "provider"
     assert p["metadata"] == {"provider_id": "mod3", "kinds": ["audio"]}
-    assert p["session_id"] == "slowbro-laptop-mod3-provider"
+    assert p["session_id"] == f"{_TEST_HOSTNAME}-mod3-provider"
 
 
 def test_session_register_user_participant_type(

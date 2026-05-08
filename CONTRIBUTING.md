@@ -5,7 +5,7 @@ Thanks for your interest. This is the CogOS filesystem-coding-agent sandbox expo
 ## Development setup
 
 ```sh
-git clone https://github.com/cogos-dev/cog-sandbox-mcp.git
+git clone https://github.com/myrgic/cog-sandbox-mcp.git
 cd cog-sandbox-mcp
 uv sync --extra dev --extra evals
 ```
@@ -67,7 +67,7 @@ New `cogos_*` tools should:
 
 ## Reporting issues
 
-Use the org-level [Bug Report](https://github.com/cogos-dev/cog-sandbox-mcp/issues/new?template=bug.yml) or [Feature Request](https://github.com/cogos-dev/cog-sandbox-mcp/issues/new?template=feature.yml) forms.
+Use the org-level [Bug Report](https://github.com/myrgic/cog-sandbox-mcp/issues/new?template=bug.yml) or [Feature Request](https://github.com/myrgic/cog-sandbox-mcp/issues/new?template=feature.yml) forms.
 
 ## License
 

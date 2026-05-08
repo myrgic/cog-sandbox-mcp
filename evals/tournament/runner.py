@@ -39,7 +39,7 @@ Implication: claude-code trial results measure answer quality (content_contains_
 rubrics) but NOT tool-call compliance (expected_tools, first_tool_one_of).
 
 There is NO kernel-side workaround via cog_dispatch_to_harness today.
-HarnessDispatcher.DispatchToHarness in cogos-dev/cogos/agent_dispatch.go (lines
+HarnessDispatcher.DispatchToHarness in myrgic/cogos/agent_dispatch.go (lines
 113-125) only switches between two model routes: DispatchModel26B (LM Studio
 OpenAI-compat) and DispatchModelE4B (local Ollama, default). Unknown model
 strings — including "sonnet", "claude-sonnet-4-6", anything else — silently

@@ -1194,7 +1194,7 @@ def cogos_channel_join(
       participant_id:   the participant identity for this attendant. For
                         agents this is typically the identity card name
                         (``cog``, ``sandy``); for users, the user handle
-                        (``slowbro``); for providers, the provider id.
+                        (e.g. ``dev-user``); for providers, the provider id.
       participant_type: one of ``"agent" | "user" | "provider"``. Defaults
                         to ``"agent"`` since the most common caller is a
                         Claude Code session. Client-side validation rejects
