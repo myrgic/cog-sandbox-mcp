@@ -34,9 +34,9 @@ Every session that participates in the substrate has a **session_id** — a stab
 | `session-slug` | CogOS | Which session (ephemeral process identity within workspace+node). |
 
 Examples:
-- `slowbro-laptop-cog-manager`
-- `slowbro-laptop-cogos-refactor-001`
-- `slowbro-desktop-loro-eval-01JQTZ...` (auto-generated ULID)
+- `dev-laptop-cog-manager`
+- `dev-laptop-cogos-refactor-001`
+- `dev-desktop-loro-eval-01JQTZ...` (auto-generated ULID)
 
 Rules:
 - ASCII, lowercase, `[a-z0-9-]` only. No underscores (keep separator unambiguous).
@@ -68,9 +68,9 @@ First event a session emits on connection. Announces presence.
 {
   "type": "session.register",
   "payload": {
-    "session_id": "slowbro-laptop-cog-manager",
-    "workspace": "/Users/slowbro/workspaces/cog",
-    "hostname": "slowbro-laptop",
+    "session_id": "dev-laptop-cog-manager",
+    "workspace": "${COGOS_WORKSPACE}",
+    "hostname": "dev-laptop",
     "started_at": "2026-04-21T10:00:00Z",
     "model": "claude-opus-4-6",
     "role": "manager",
@@ -90,8 +90,8 @@ First event a session emits on connection. Announces presence.
 {
   "type": "session.register",
   "payload": {
-    "session_id": "slowbro-laptop-mod3-provider",
-    "workspace": "/Users/slowbro/workspaces/cogos-dev/mod3",
+    "session_id": "dev-laptop-mod3-provider",
+    "workspace": "${COGOS_WORKSPACE}/../mod3",
     "role": "audio-provider",
     "task": "mediating voice-room-primary",
     "participant_type": "provider",
@@ -113,7 +113,7 @@ Periodic keep-alive. Sessions emit every N minutes (default 5). Absence of heart
 {
   "type": "session.heartbeat",
   "payload": {
-    "session_id": "slowbro-laptop-cog-manager",
+    "session_id": "dev-laptop-cog-manager",
     "status": "active",
     "context_usage": 0.62,
     "current_task": "drafting handoff protocol spec",
@@ -132,7 +132,7 @@ Final event before a session closes cleanly. Optional but recommended.
 {
   "type": "session.end",
   "payload": {
-    "session_id": "slowbro-laptop-cog-manager",
+    "session_id": "dev-laptop-cog-manager",
     "ended_at": "2026-04-21T12:04:00Z",
     "reason": "task-complete|context-exhausted|user-quit|handed-off",
     "handoff_id": "ho-01JQ..."
@@ -153,7 +153,7 @@ Session A writes this when it wants to hand off — either because context is ex
   "type": "handoff.offer",
   "payload": {
     "handoff_id": "ho-01JQTZ7P8X9M0A7K5ZQXJ3BWVF",
-    "from_session": "slowbro-laptop-cog-manager",
+    "from_session": "dev-laptop-cog-manager",
     "to_session": null,
     "reason": "context-exhaustion",
     "created_at": "2026-04-21T11:45:00Z",
@@ -189,7 +189,7 @@ Session A writes this when it wants to hand off — either because context is ex
     },
     "bootstrap_prompt": "You are picking up Session A's work on the EA/EFM context-engine split. Wave 1 landed cleanly; you are starting Wave 2. Read the files listed in files_touched for full context. Critical invariants: /health may return 200 or 503 (both are valid); the context engine must remain inference-independent. First action: run `go build ./...` and report. If clean, proceed to the integration tests per next_steps.",
     "bus_context_refs": [
-      {"bus_id": "bus_chat_slowbro-laptop-cog-manager", "after_seq": 104}
+      {"bus_id": "bus_chat_dev-laptop-cog-manager", "after_seq": 104}
     ],
     "memory_refs": [
       "cog://mem/working/handoff-state-01JQTZ7P8X.cog.md"
@@ -214,8 +214,8 @@ Session B posts this when it begins work on an open offer. Establishes ownership
   "type": "handoff.claim",
   "payload": {
     "handoff_id": "ho-01JQTZ7P8X9M0A7K5ZQXJ3BWVF",
-    "claiming_session": "slowbro-laptop-cog-relay-2",
-    "previous_session": "slowbro-laptop-cog-manager",
+    "claiming_session": "dev-laptop-cog-relay-2",
+    "previous_session": "dev-laptop-cog-manager",
     "claimed_at": "2026-04-21T11:52:00Z"
   }
 }
@@ -232,7 +232,7 @@ Session B emits this when the handed-off work is done (or when B itself re-offer
   "type": "handoff.complete",
   "payload": {
     "handoff_id": "ho-01JQTZ7P8X9M0A7K5ZQXJ3BWVF",
-    "completing_session": "slowbro-laptop-cog-relay-2",
+    "completing_session": "dev-laptop-cog-relay-2",
     "outcome": "done",
     "next_handoff_id": null,
     "completed_at": "2026-04-21T13:10:00Z",
@@ -329,10 +329,10 @@ Every rejected claim also emits a `handoff.claim_rejected` event to `bus_handoff
 ```json
 {
   "handoff_id": "ho-1732136400000-abc123def456",
-  "attempting_session": "slowbro-laptop-loser-session",
+  "attempting_session": "dev-laptop-loser-session",
   "reason": "already_claimed",
   "rejected_at": "2026-04-22T12:00:00.123456Z",
-  "conflicting_session": "slowbro-laptop-winner-session"
+  "conflicting_session": "dev-laptop-winner-session"
 }
 ```
 
