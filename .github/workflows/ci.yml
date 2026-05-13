@@ -36,8 +36,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install uv
         run: pip install uv
-      - name: Install package with dev extras
-        run: uv pip install --system -e ".[dev]"
+      - name: Install package with dev + evals extras
+        run: uv pip install --system -e ".[dev,evals]"
       - name: Run pytest
         run: pytest tests/ evals/tournament/tests/ evals/harness/tests/ -v --tb=short
 
