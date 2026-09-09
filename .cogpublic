@@ -1,0 +1,62 @@
+# .cogpublic — Public release gate for myrgic/cog-sandbox-mcp
+# Defines what must never cross the boundary outward.
+#
+# ENFORCED BY: the org-level Public Release Gate workflow
+#   (myrgic/.github/.github/workflows/public-release-gate.yml), run in CI on
+#   every PR. Locally, from a checkout of myrgic/.github:
+#     python3 scripts/cogpublic-guard.py --root /path/to/cog-sandbox-mcp
+#
+# WHY THIS REPO HAS ONE: the org survey found 9 historical leak-pattern hits
+# in this repo's git history. Verified at adoption (2026-08-31) that NOTHING
+# is live at HEAD — the gate exists to keep it that way, because history
+# shows the patterns do get written here and only get caught by scrubs.
+
+version: 1
+
+content_guards:
+  - pattern: "/Users/slowbro"
+    description: "Hardcoded operator home directory (macOS)"
+  - pattern: "/home/slowbro"
+    description: "Hardcoded operator home directory (Linux)"
+  - pattern: "-Users-slowbro-"
+    description: "Claude project path encoding"
+  - pattern: "192404964621025291"
+    description: "Personal Discord user snowflake"
+  - pattern: 'sk-[a-zA-Z0-9]{20,}'
+    description: "OpenAI API key pattern"
+  - pattern: 'ghp_[a-zA-Z0-9]{20,}'
+    description: "GitHub personal access token"
+  - pattern: 'xoxb-[a-zA-Z0-9]+'
+    description: "Slack bot token"
+  - pattern: '@gmail\.com|@yahoo\.com|@hotmail\.com'
+    description: "Personal email address (git author emails exempt)"
+
+# DELIBERATELY NOT GUARDED, verified 2026-08-31 — recorded so the next person
+# does not "helpfully" add them:
+#
+#   "token" / "api_token" / LMS_API_TOKEN — evals/runner.py and
+#     evals/tournament/* handle an LM Studio API token strictly via the
+#     LMS_API_TOKEN environment variable (evals/runner.py:124,
+#     evals/tournament/runner.py:601); no literal token exists in the tree.
+#     Guarding the word would flag the code that correctly avoids embedding
+#     one.
+#
+#   "secret" — evals/tournament/tests/test_terminal_bench_adapter.py
+#     references task id "tb-015-sanitize-git-secret", a benchmark task NAME
+#     about secret hygiene, not a secret.
+#
+#   Bearer-header regex — client_chat.py:125 builds "Bearer {api_token}"
+#     from the env var; a Bearer guard would fire on the interpolation site.
+
+# Paths the scan skips. Vendored blobs and caches are not ours to sanitize,
+# and scanning them produces noise that trains people to ignore the gate.
+exclude:
+  - vendor/**
+  - node_modules/**
+  - .venv/**
+  - "*.onnx"
+  - "*.pt"
+  - "*.safetensors"
+  - "*.gguf"
+  - uv.lock
+  - "evals/.env"

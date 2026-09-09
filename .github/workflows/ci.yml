@@ -7,6 +7,9 @@ on:
     branches: [main]
 
 jobs:
+  public-release-gate:
+    uses: myrgic/.github/.github/workflows/public-release-gate.yml@main
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
